@@ -1,7 +1,7 @@
 [project]
 name = "inferx"
 version = "0.1.0"
-description = "Add your description here"
+description = "LLM inference gateway with cost-aware routing, fault tolerance, and reproducible benchmarks"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
