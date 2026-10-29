@@ -23,4 +23,4 @@ def health() -> dict[str, str]:
     Load balancers, Docker, and monitoring tools call this endpoint
     to check whether the service is alive.
     """
-    return {"status": "ok", "version": APP_VERSION}
+    return {"status": "broken", "version": APP_VERSION}
