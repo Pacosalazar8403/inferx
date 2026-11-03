@@ -12,14 +12,17 @@ InferX sits between client applications and multiple language model backends. Ea
 
 ### Current features
 
-- FastAPI service with a `/health` endpoint and auto-generated OpenAPI docs
-- Automated tests with pytest
-- Continuous integration with GitHub Actions
+- OpenAI-compatible `POST /v1/chat/completions` endpoint (subset of the format)
+- Request validation with clear `422` errors for invalid input
+- Backend interface, with a mock backend that supports simulated latency and forced failures
+- `502 Bad Gateway` responses when a backend fails, without exposing internal details
+- `/health` endpoint and auto-generated OpenAPI docs
+- Automated tests with pytest, run in CI on every pull request
 
 ### Planned
 
-- Chat endpoint with streaming responses
-- Multiple model backends (local model, hosted model, and a mock backend for testing)
+- Streaming responses for the chat endpoint
+- Real model backends (local model and hosted model)
 - Configurable routing by prompt length, cost budget, and latency target
 - Timeouts, retries with backoff, and circuit breakers
 - Per-key rate limiting and response caching (Redis)
@@ -38,11 +41,19 @@ uv sync
 uv run uvicorn inferx.app:app --reload
 ```
 
-In another terminal:
+In another terminal, check that the service is up:
 
 ```bash
 curl http://127.0.0.1:8000/health
 # {"status":"ok","version":"0.1.0"}
+```
+
+Send a chat request (currently answered by the mock backend):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "mock", "messages": [{"role": "user", "content": "Hello InferX"}]}'
 ```
 
 Interactive API docs are available at http://127.0.0.1:8000/docs.
@@ -57,8 +68,12 @@ uv run pytest -v
 
 ```
 inferx/
-├── src/inferx/          application code
-│   └── app.py           FastAPI app and routes
+├── src/inferx/
+│   ├── app.py           FastAPI app and routes
+│   ├── schemas.py       request and response models
+│   └── backends/
+│       ├── base.py      backend interface
+│       └── mock.py      mock backend for development and testing
 ├── tests/               automated tests
 ├── .github/workflows/   CI pipeline
 ├── pyproject.toml       project metadata and dependencies
@@ -67,4 +82,4 @@ inferx/
 
 ## Tech stack
 
-Python 3.12, FastAPI, Uvicorn, pytest, uv, GitHub Actions
+Python 3.12, FastAPI, Uvicorn, Pydantic, pytest, uv, GitHub Actions
