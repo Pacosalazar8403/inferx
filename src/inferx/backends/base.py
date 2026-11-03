@@ -22,3 +22,9 @@ class Backend(ABC):
     @abstractmethod
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Generate a reply for the given conversation."""
+
+    async def aclose(self) -> None:
+        """Release resources the backend holds, like open connections.
+
+        Backends with nothing to clean up can rely on this default.
+        """
