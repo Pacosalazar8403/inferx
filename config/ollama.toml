@@ -1,0 +1,19 @@
+# Two local Ollama models: short prompts go to the 1B model,
+# longer prompts go to the 3B model.
+
+[routing]
+small_backend = "ollama-small"
+large_backend = "ollama-large"
+max_small_prompt_chars = 200
+
+[[backends]]
+type = "openai"
+name = "ollama-small"
+base_url = "http://127.0.0.1:11434/v1"
+model = "llama3.2:1b"
+
+[[backends]]
+type = "openai"
+name = "ollama-large"
+base_url = "http://127.0.0.1:11434/v1"
+model = "llama3.2:3b"
