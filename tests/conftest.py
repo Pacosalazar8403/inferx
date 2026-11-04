@@ -12,10 +12,10 @@ from inferx.app import app
 def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     """A test client with the app's startup and shutdown running.
 
-    Forces the mock backend, so tests never depend on the developer's
+    Uses the built-in mock config, so tests never depend on the developer's
     environment variables or on a running model server.
     """
-    monkeypatch.setenv("INFERX_BACKEND", "mock")
+    monkeypatch.delenv("INFERX_CONFIG_PATH", raising=False)
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
