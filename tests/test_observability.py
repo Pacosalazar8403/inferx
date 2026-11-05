@@ -3,10 +3,18 @@
 import json
 import logging
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from inferx.observability import JsonFormatter, configure_logging
+import pytest
+
+from inferx.observability import (
+    JsonFormatter,
+    configure_logging,
+    reset_request_id,
+    set_request_id,
+)
 
 
 def make_record(**extra: Any) -> logging.LogRecord:
@@ -26,6 +34,18 @@ def make_record(**extra: Any) -> logging.LogRecord:
 
 def format_as_json(record: logging.LogRecord) -> dict[str, Any]:
     return json.loads(JsonFormatter().format(record))
+
+
+@pytest.fixture
+def configured_logging() -> Iterator[None]:
+    """Configure InferX logging for one test, then restore the handlers."""
+    logger = logging.getLogger("inferx")
+    original_handlers = logger.handlers[:]
+    configure_logging()
+    try:
+        yield
+    finally:
+        logger.handlers = original_handlers
 
 
 def test_includes_standard_fields() -> None:
@@ -62,14 +82,35 @@ def test_values_that_are_not_json_become_strings() -> None:
     assert entry["config_path"] == "config/ollama.toml"
 
 
-def test_configure_logging_does_not_add_duplicate_handlers() -> None:
-    logger = logging.getLogger("inferx")
-    original_handlers = logger.handlers[:]
-    try:
-        configure_logging()
-        configure_logging()
+def test_configure_logging_does_not_add_duplicate_handlers(configured_logging: None) -> None:
+    configure_logging()
 
-        assert len(logger.handlers) == 1
-        assert isinstance(logger.handlers[0].formatter, JsonFormatter)
+    logger = logging.getLogger("inferx")
+    assert len(logger.handlers) == 1
+    assert isinstance(logger.handlers[0].formatter, JsonFormatter)
+
+
+def test_log_records_carry_the_current_request_id(
+    configured_logging: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inferx")
+
+    token = set_request_id("ctx-123")
+    try:
+        logging.getLogger("inferx.deep.inside").info("hello from a backend")
     finally:
-        logger.handlers = original_handlers
+        reset_request_id(token)
+
+    (record,) = [r for r in caplog.records if r.getMessage() == "hello from a backend"]
+    assert record.request_id == "ctx-123"
+
+
+def test_request_id_is_none_outside_a_request(
+    configured_logging: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inferx")
+
+    logging.getLogger("inferx.startup").info("starting up")
+
+    (record,) = [r for r in caplog.records if r.getMessage() == "starting up"]
+    assert record.request_id is None
