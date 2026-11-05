@@ -1,5 +1,5 @@
 """Gateway configuration: which backends exist, how requests are routed,
-and how failures are retried.
+and how failures are retried and contained.
 
 Loaded from a TOML file so several backends can be described in one place.
 Secrets never go in this file: a backend names the environment variable
@@ -14,9 +14,11 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from inferx.backends.base import Backend
+from inferx.backends.circuit_breaking import CircuitBreakerBackend
 from inferx.backends.mock import MockBackend
 from inferx.backends.openai_compatible import OpenAICompatibleBackend
 from inferx.backends.retrying import RetryingBackend, RetryPolicy
+from inferx.circuit_breaker import CircuitBreaker
 from inferx.router import LengthRouter
 
 
@@ -85,12 +87,26 @@ class RetryConfig(BaseModel):
         )
 
 
+class CircuitBreakerConfig(BaseModel):
+    """Circuit breaker settings applied to every backend.
+
+    A backend's circuit opens after failure_threshold requests in a row fail
+    (each after its retries), and stays open for cooldown_seconds.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    failure_threshold: int = Field(default=5, ge=1)
+    cooldown_seconds: float = Field(default=30.0, gt=0)
+
+
 class GatewayConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     backends: list[BackendConfig] = Field(min_length=1)
     routing: RoutingConfig
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
 
     @model_validator(mode="after")
     def check_backend_names_are_unique(self) -> "GatewayConfig":
@@ -123,7 +139,7 @@ def load_config(path: Path) -> GatewayConfig:
 
 
 def build_backend(config: MockBackendConfig | OpenAIBackendConfig) -> Backend:
-    """Create one backend from its config, without retries."""
+    """Create one backend from its config, without retries or a breaker."""
     if isinstance(config, MockBackendConfig):
         return MockBackend(
             name=config.name,
@@ -151,12 +167,22 @@ def build_backend(config: MockBackendConfig | OpenAIBackendConfig) -> Backend:
 
 
 def build_backends(config: GatewayConfig) -> dict[str, Backend]:
-    """Create every configured backend, wrapped with retries, keyed by name."""
+    """Create every configured backend with retries and a circuit breaker.
+
+    The breaker wraps the retries, so one breaker failure means one request
+    that still failed after all of its retries.
+    """
     policy = config.retry.to_policy()
-    return {
-        backend.name: RetryingBackend(build_backend(backend), policy)
-        for backend in config.backends
-    }
+    backends: dict[str, Backend] = {}
+    for backend_config in config.backends:
+        retrying = RetryingBackend(build_backend(backend_config), policy)
+        breaker = CircuitBreaker(
+            name=backend_config.name,
+            failure_threshold=config.circuit_breaker.failure_threshold,
+            cooldown_seconds=config.circuit_breaker.cooldown_seconds,
+        )
+        backends[backend_config.name] = CircuitBreakerBackend(retrying, breaker)
+    return backends
 
 
 def build_router(config: GatewayConfig) -> LengthRouter:

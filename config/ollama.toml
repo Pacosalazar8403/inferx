@@ -17,6 +17,12 @@ max_attempts = 3
 base_delay_seconds = 0.1
 max_delay_seconds = 2.0
 
+# After 5 requests in a row fail (each after its retries), stop calling that
+# backend for 30 seconds, then let one probe request test it.
+[circuit_breaker]
+failure_threshold = 5
+cooldown_seconds = 30.0
+
 [[backends]]
 type = "openai"
 name = "ollama-small"

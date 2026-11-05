@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from inferx.backends.circuit_breaking import CircuitBreakerBackend
 from inferx.backends.mock import MockBackend
 from inferx.backends.openai_compatible import OpenAICompatibleBackend
-from inferx.backends.retrying import RetryingBackend
 from inferx.gateway_config import (
     DEFAULT_CONFIG,
     MockBackendConfig,
@@ -45,6 +45,12 @@ base_delay_seconds = 0.2
 max_delay_seconds = 4.0
 """
 
+CIRCUIT_BREAKER_SECTION = """
+[circuit_breaker]
+failure_threshold = 2
+cooldown_seconds = 10.0
+"""
+
 
 def write_config(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "gateway.toml"
@@ -60,23 +66,24 @@ def with_fallbacks(fallbacks: str) -> str:
     )
 
 
-def test_default_config_builds_retrying_backends_and_router() -> None:
+def test_default_config_builds_protected_backends_and_router() -> None:
     backends = build_backends(DEFAULT_CONFIG)
     router = build_router(DEFAULT_CONFIG)
 
     assert set(backends) == {"mock-small", "mock-large"}
-    assert all(isinstance(backend, RetryingBackend) for backend in backends.values())
+    assert all(isinstance(backend, CircuitBreakerBackend) for backend in backends.values())
     assert router.small_backend == "mock-small"
     assert router.fallback_backends == ()
 
 
-def test_loads_valid_config_file_with_default_retries(tmp_path: Path) -> None:
+def test_loads_valid_config_file_with_defaults(tmp_path: Path) -> None:
     config = load_config(write_config(tmp_path, VALID_CONFIG))
 
     assert [backend.name for backend in config.backends] == ["small", "large"]
     assert isinstance(config.backends[1], OpenAIBackendConfig)
     assert config.backends[1].model == "big-model"
     assert config.retry.max_attempts == 3
+    assert config.circuit_breaker.failure_threshold == 5
 
 
 def test_loads_retry_settings(tmp_path: Path) -> None:
@@ -86,6 +93,16 @@ def test_loads_retry_settings(tmp_path: Path) -> None:
     assert policy.max_attempts == 5
     assert policy.base_delay_seconds == 0.2
     assert policy.max_delay_seconds == 4.0
+
+
+def test_loads_circuit_breaker_settings(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, VALID_CONFIG + CIRCUIT_BREAKER_SECTION))
+
+    backends = build_backends(config)
+
+    breaker = backends["small"].breaker
+    assert breaker.failure_threshold == 2
+    assert breaker.cooldown_seconds == 10.0
 
 
 def test_example_config_in_repo_is_valid() -> None:
@@ -132,6 +149,15 @@ def test_rejects_zero_retry_attempts(tmp_path: Path) -> None:
 
 def test_rejects_too_many_retry_attempts(tmp_path: Path) -> None:
     text = VALID_CONFIG + RETRY_SECTION.replace("max_attempts = 5", "max_attempts = 100")
+
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, text))
+
+
+def test_rejects_zero_circuit_breaker_threshold(tmp_path: Path) -> None:
+    text = VALID_CONFIG + CIRCUIT_BREAKER_SECTION.replace(
+        "failure_threshold = 2", "failure_threshold = 0"
+    )
 
     with pytest.raises(ValidationError):
         load_config(write_config(tmp_path, text))
