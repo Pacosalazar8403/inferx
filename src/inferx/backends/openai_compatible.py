@@ -9,6 +9,10 @@ import httpx2
 from inferx.backends.base import Backend, BackendError
 from inferx.schemas import ChatCompletionRequest, ChatCompletionResponse
 
+# Statuses that usually mean "try again later": request timeout, too early,
+# rate limited, and temporary server-side failures.
+RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
 
 class OpenAICompatibleBackend(Backend):
     """Sends chat requests to an OpenAI-compatible server over HTTP."""
@@ -46,9 +50,24 @@ class OpenAICompatibleBackend(Backend):
 
         try:
             response = await self._client.post("/chat/completions", json=payload)
-            response.raise_for_status()
+        except (httpx2.TimeoutException, httpx2.NetworkError) as error:
+            # The server was unreachable or too slow. Trying again may work.
+            raise BackendError(
+                f"backend '{self.name}' could not be reached: {error!r}",
+                retryable=True,
+            ) from error
         except httpx2.HTTPError as error:
-            raise BackendError(f"backend '{self.name}' request failed: {error}") from error
+            # Anything else (like an invalid URL) will fail the same way again.
+            raise BackendError(
+                f"backend '{self.name}' request failed: {error!r}"
+            ) from error
+
+        if response.status_code >= 400:
+            raise BackendError(
+                f"backend '{self.name}' returned HTTP {response.status_code}",
+                retryable=response.status_code in RETRYABLE_STATUS_CODES,
+                status_code=response.status_code,
+            )
 
         try:
             return ChatCompletionResponse.model_validate(response.json())

@@ -60,6 +60,13 @@ async def complete_with(handler: Handler, api_key: str | None = None) -> ChatCom
         await backend.aclose()
 
 
+async def error_from(handler: Handler) -> BackendError:
+    """Run a request that's expected to fail, and return the error."""
+    with pytest.raises(BackendError) as caught:
+        await complete_with(handler)
+    return caught.value
+
+
 @pytest.mark.anyio
 async def test_sends_request_with_backend_model_name() -> None:
     seen: dict[str, Any] = {}
@@ -114,40 +121,73 @@ async def test_omits_authorization_header_without_api_key() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("status_code", [429, 500, 503])
-async def test_error_status_raises_backend_error(status_code: int) -> None:
+@pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 504])
+async def test_transient_status_is_retryable(status_code: int) -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(status_code, json={"error": "something went wrong"})
+        return httpx2.Response(status_code, json={"error": "try again later"})
 
-    with pytest.raises(BackendError, match="test-backend"):
-        await complete_with(handler)
+    error = await error_from(handler)
+
+    assert error.retryable is True
+    assert error.status_code == status_code
+    assert "test-backend" in str(error)
 
 
 @pytest.mark.anyio
-async def test_connection_failure_raises_backend_error() -> None:
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+async def test_permanent_status_is_not_retryable(status_code: int) -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status_code, json={"error": "bad request"})
+
+    error = await error_from(handler)
+
+    assert error.retryable is False
+    assert error.status_code == status_code
+
+
+@pytest.mark.anyio
+async def test_connection_failure_is_retryable() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         raise httpx2.ConnectError("connection refused", request=request)
 
-    with pytest.raises(BackendError, match="request failed"):
-        await complete_with(handler)
+    error = await error_from(handler)
+
+    assert error.retryable is True
+    assert error.status_code is None
+    assert "ConnectError" in str(error)
 
 
 @pytest.mark.anyio
-async def test_invalid_json_raises_backend_error() -> None:
+async def test_timeout_is_retryable() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ReadTimeout("", request=request)
+
+    error = await error_from(handler)
+
+    assert error.retryable is True
+    # The message is empty, so the type name is what tells us what happened.
+    assert "ReadTimeout" in str(error)
+
+
+@pytest.mark.anyio
+async def test_invalid_json_is_not_retryable() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(200, text="this is not json")
 
-    with pytest.raises(BackendError, match="invalid response"):
-        await complete_with(handler)
+    error = await error_from(handler)
+
+    assert error.retryable is False
+    assert "invalid response" in str(error)
 
 
 @pytest.mark.anyio
-async def test_wrong_response_shape_raises_backend_error() -> None:
+async def test_wrong_response_shape_is_not_retryable() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(200, json={"unexpected": "shape"})
 
-    with pytest.raises(BackendError, match="invalid response"):
-        await complete_with(handler)
+    error = await error_from(handler)
+
+    assert error.retryable is False
 
 
 def test_rejects_non_positive_timeout() -> None:
