@@ -26,11 +26,13 @@ InferX sits between client applications and multiple language model backends. Ea
 - Mock backend with simulated latency and forced failures (retryable or permanent), used for tests and CI
 - Strict config validation at startup: typos, unknown backend types, duplicate names, invalid retry, fallback, circuit breaker, or time limit settings, backend timeouts longer than the request budget, and missing API key variables are rejected before the server accepts traffic
 - Clear errors: `422` for invalid requests, `404` for unknown models, `502` when backends fail, `504` when the time budget runs out (full details go to the server logs, not to the client)
+- Docker image: multi-stage build with locked dependencies, runs as a non-root user, and has a built-in health check
 - `/health` endpoint and auto-generated OpenAPI docs
-- Automated tests with pytest, run in CI on every pull request
+- Automated tests with pytest, plus a Docker build and smoke test, run in CI on every pull request
 
 ### Planned
 
+- Docker Compose setup with Ollama in its own container
 - Streaming responses for the chat endpoint
 - Routing by cost budget and latency target
 - Smarter routing, evaluated against the length-based router as a baseline
@@ -71,6 +73,42 @@ INFERX_CONFIG_PATH=config/ollama.toml uv run uvicorn inferx.app:app --reload --n
 ```
 
 Short prompts now go to `llama3.2:1b` and longer prompts to `llama3.2:3b`. If one model keeps failing, requests fall back to the other.
+
+## Running with Docker
+
+Build the image:
+
+```bash
+docker build -t inferx:dev .
+```
+
+Run it with the built-in mock backends:
+
+```bash
+docker run --rm -p 127.0.0.1:8000:8000 inferx:dev
+```
+
+`-p 127.0.0.1:8000:8000` publishes the port only to your own machine. Plain `-p 8000:8000` would expose InferX to every network the machine is connected to.
+
+The image:
+
+- uses a multi-stage build, so uv and build caches never reach the final image
+- installs exactly the versions in `uv.lock`
+- runs as an unprivileged `inferx` user, not root
+- has a `HEALTHCHECK` that calls `/health`, so `docker ps` shows whether the container is healthy
+
+### Reaching Ollama from the container
+
+Every container has its own network, so inside the container `127.0.0.1` means the container itself, not your machine. With the example config, InferX can't reach an Ollama server running on your machine, and requests fail with `502` after retries and fallback.
+
+For local development on Linux, share your machine's network with `--network host`:
+
+```bash
+docker run --rm --network host -e INFERX_CONFIG_PATH=config/ollama.toml inferx:dev \
+  uvicorn inferx.app:app --host 127.0.0.1 --port 8000 --no-access-log
+```
+
+With host networking, the container has no network boundary of its own, so the command is overridden to listen only on `127.0.0.1`. Running Ollama in its own container on a shared Docker network is the planned long-term setup.
 
 ## How failures are handled
 
@@ -140,6 +178,8 @@ InferX reads these environment variables:
 | `INFERX_CONFIG_PATH` | none | Path to a TOML config file. Without one, InferX uses two built-in mock backends. |
 | `INFERX_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 
+In Docker, pass them with `-e`, for example `-e INFERX_CONFIG_PATH=config/ollama.toml`. The image includes the `config` folder at `/app/config`.
+
 The config file lists the backends, the routing rules, the retry policy, the circuit breaker settings, and the time limits. See [`config/ollama.toml`](config/ollama.toml) for a complete example.
 
 ```toml
@@ -207,6 +247,7 @@ The `max_small_prompt_chars` threshold in the example is a starting guess, not a
 - **Permanent failures don't fall back.** This is deliberate, so a misconfigured backend (like a bad API key) shows up as errors instead of silently shifting traffic, but it means some requests fail that another backend could have answered.
 - **One retry and circuit breaker policy for all backends.** A hosted API might deserve different settings than a local model.
 - **Retries can stack with other layers.** If clients and model servers also retry, attempts multiply. Keep `max_attempts` small.
+- **The Docker setup reaches a local Ollama only through host networking.** That works on Linux for development but gives up network isolation. The image is also not published to a registry yet.
 
 ## Running tests
 
@@ -215,6 +256,8 @@ uv run pytest -v
 ```
 
 Tests use mock backends, a mock HTTP transport, a fake sleep function, and a fake clock, so they never need a model server. The deadline tests use short real timeouts (about 0.2 seconds) to check that cancellation really happens.
+
+CI also builds the Docker image, starts a container, waits for `/health`, and checks that it runs as a non-root user.
 
 ## Project structure
 
@@ -237,11 +280,13 @@ inferx/
 │       ├── openai_compatible.py  HTTP backend for OpenAI-compatible servers
 │       └── retrying.py           retry wrapper with backoff and jitter
 ├── tests/                        automated tests (shared fixtures in conftest.py)
-├── .github/workflows/            CI pipeline
+├── .github/workflows/            CI pipeline (tests and Docker smoke test)
+├── Dockerfile                    multi-stage image build
+├── .dockerignore                 files kept out of the image build
 ├── pyproject.toml                project metadata and dependencies
 └── uv.lock                       exact locked dependency versions
 ```
 
 ## Tech stack
 
-Python 3.12, FastAPI, Uvicorn, Pydantic, pydantic-settings, httpx2, pytest, uv, Ollama, GitHub Actions
+Python 3.12, FastAPI, Uvicorn, Pydantic, pydantic-settings, httpx2, pytest, uv, Docker, Ollama, GitHub Actions
