@@ -37,6 +37,17 @@ jobs:
       - name: Check out the code
         uses: actions/checkout@v7
 
+      - name: Check the Compose file
+        run: docker compose config --quiet
+
+      - name: Check the Prometheus config
+        run: |
+          docker run --rm \
+            -v "$PWD/monitoring:/etc/prometheus:ro" \
+            --entrypoint promtool \
+            prom/prometheus:v3.11.3 \
+            check config /etc/prometheus/prometheus.yml
+
       - name: Build the image
         run: docker build -t inferx:ci .
 
@@ -57,6 +68,9 @@ jobs:
 
       - name: Check it runs as a non-root user
         run: test "$(docker exec inferx whoami)" = "inferx"
+
+      - name: Check the metrics endpoint
+        run: curl -fsS http://127.0.0.1:8000/metrics | grep -q inferx_http_requests_total
 
       - name: Show container logs
         if: always()
