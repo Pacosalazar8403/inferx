@@ -52,6 +52,14 @@ def write_config(tmp_path: Path, text: str) -> Path:
     return path
 
 
+def with_fallbacks(fallbacks: str) -> str:
+    """VALID_CONFIG with a fallback_backends line added to [routing]."""
+    return VALID_CONFIG.replace(
+        "max_small_prompt_chars = 100",
+        f"max_small_prompt_chars = 100\nfallback_backends = {fallbacks}",
+    )
+
+
 def test_default_config_builds_retrying_backends_and_router() -> None:
     backends = build_backends(DEFAULT_CONFIG)
     router = build_router(DEFAULT_CONFIG)
@@ -59,6 +67,7 @@ def test_default_config_builds_retrying_backends_and_router() -> None:
     assert set(backends) == {"mock-small", "mock-large"}
     assert all(isinstance(backend, RetryingBackend) for backend in backends.values())
     assert router.small_backend == "mock-small"
+    assert router.fallback_backends == ()
 
 
 def test_loads_valid_config_file_with_default_retries(tmp_path: Path) -> None:
@@ -82,7 +91,8 @@ def test_loads_retry_settings(tmp_path: Path) -> None:
 def test_example_config_in_repo_is_valid() -> None:
     config = load_config(REPO_ROOT / "config" / "ollama.toml")
 
-    build_router(config)
+    router = build_router(config)
+    assert router.fallback_backends == ("ollama-large", "ollama-small")
 
 
 def test_rejects_misspelled_field(tmp_path: Path) -> None:
@@ -135,11 +145,29 @@ def test_router_pointing_at_missing_backend_is_rejected(tmp_path: Path) -> None:
         build_router(config)
 
 
+def test_loads_fallback_backends(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, with_fallbacks('["large", "small"]')))
+
+    router = build_router(config)
+
+    assert router.fallback_backends == ("large", "small")
+
+
+def test_rejects_unknown_fallback_backend(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, with_fallbacks('["large", "typo"]')))
+
+    with pytest.raises(ValueError, match="unknown backends"):
+        build_router(config)
+
+
 def test_mock_backend_can_be_configured_to_fail() -> None:
-    backend = build_backend(MockBackendConfig(type="mock", name="broken", fail=True))
+    backend = build_backend(
+        MockBackendConfig(type="mock", name="broken", fail=True, retryable_failures=False)
+    )
 
     assert isinstance(backend, MockBackend)
     assert backend.fail is True
+    assert backend.retryable_failures is False
 
 
 @pytest.mark.anyio

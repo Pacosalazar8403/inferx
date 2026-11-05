@@ -46,6 +46,17 @@ def get_or_create_request_id(incoming: str | None) -> str:
     return uuid.uuid4().hex
 
 
+def routing_headers(backend: str, reason: str, fallback_from: str | None) -> dict[str, str]:
+    """Headers telling the caller which backend answered, why, and if it was a fallback."""
+    headers = {
+        "X-InferX-Backend": backend,
+        "X-InferX-Route-Reason": reason,
+    }
+    if fallback_from is not None:
+        headers["X-InferX-Fallback-From"] = fallback_from
+    return headers
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Build the router and backends at startup, close backends at shutdown."""
@@ -103,6 +114,7 @@ async def log_requests(
                 # Set by the chat endpoint. Other routes leave these empty.
                 "backend": getattr(request.state, "backend", None),
                 "route_reason": getattr(request.state, "route_reason", None),
+                "fallback_from": getattr(request.state, "fallback_from", None),
                 "backend_latency_ms": getattr(request.state, "backend_latency_ms", None),
             },
         )
@@ -143,7 +155,7 @@ async def chat_completions(
     router: Annotated[LengthRouter, Depends(get_router)],
     backends: Annotated[dict[str, Backend], Depends(get_backends)],
 ) -> ChatCompletionResponse:
-    """Route a chat request to a backend and return its reply."""
+    """Route a chat request to a backend, falling back if it keeps failing."""
     try:
         decision = router.route(chat_request)
     except UnknownModelError as error:
@@ -152,36 +164,63 @@ async def chat_completions(
             detail=f"Unknown model '{chat_request.model}'. Use 'auto' or a configured backend name.",
         ) from error
 
-    # Shared with the logging middleware, which writes them in its log line.
-    http_request.state.backend = decision.backend
     http_request.state.route_reason = decision.reason
 
-    # Tell the caller which backend handled the request and why.
-    routing_headers = {
-        "X-InferX-Backend": decision.backend,
-        "X-InferX-Route-Reason": decision.reason,
-    }
-    response.headers.update(routing_headers)
+    # The routed backend first, then any fallbacks, in order.
+    candidates = [decision.backend, *decision.fallbacks]
 
     start = time.perf_counter()
     try:
-        return await backends[decision.backend].complete(chat_request)
-    except BackendError as error:
-        # The full error goes to the server's logs. The client only gets a
-        # generic message, so internal details never leak.
-        logger.warning(
-            "backend request failed",
-            exc_info=True,
-            extra={
-                "backend": decision.backend,
-                "retryable": error.retryable,
-                "backend_status_code": error.status_code,
-            },
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="The model backend failed to respond.",
-            headers=routing_headers,
-        ) from error
+        for index, backend_name in enumerate(candidates):
+            fallback_from = decision.backend if index > 0 else None
+
+            # Shared with the logging middleware, which writes them in its log line.
+            http_request.state.backend = backend_name
+            http_request.state.fallback_from = fallback_from
+            headers = routing_headers(backend_name, decision.reason, fallback_from)
+
+            try:
+                result = await backends[backend_name].complete(chat_request)
+            except BackendError as error:
+                has_next_candidate = index + 1 < len(candidates)
+
+                # Only fall back when the backend's health is the problem.
+                # A permanent failure would likely repeat, and silently moving
+                # traffic elsewhere could hide a misconfiguration.
+                if error.retryable and has_next_candidate:
+                    logger.warning(
+                        "falling back to another backend",
+                        exc_info=True,
+                        extra={
+                            "backend": backend_name,
+                            "fallback_to": candidates[index + 1],
+                            "backend_status_code": error.status_code,
+                        },
+                    )
+                    continue
+
+                # The full error goes to the server's logs. The client only gets
+                # a generic message, so internal details never leak.
+                logger.warning(
+                    "backend request failed",
+                    exc_info=True,
+                    extra={
+                        "backend": backend_name,
+                        "retryable": error.retryable,
+                        "backend_status_code": error.status_code,
+                    },
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="The model backend failed to respond.",
+                    headers=headers,
+                ) from error
+
+            response.headers.update(headers)
+            return result
+
+        # The loop always returns or raises, because there is always at least
+        # one candidate. This line only exists to make that explicit.
+        raise AssertionError("no backend candidates")
     finally:
         http_request.state.backend_latency_ms = elapsed_ms(start)
