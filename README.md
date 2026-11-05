@@ -17,26 +17,26 @@ InferX sits between client applications and multiple language model backends. Ea
 - Length-based router: with `"model": "auto"`, short prompts go to a small backend and long prompts go to a large one; clients can also name a backend directly
 - Retries with exponential backoff and full jitter for transient failures (timeouts, connection errors, `408`, `429`, `5xx`); permanent failures (other `4xx`, malformed responses) are never retried
 - Fallback to other backends, in a configured order, when the routed backend keeps failing with transient errors (only for `"auto"` requests)
+- Circuit breakers per backend: after repeated failures, a backend is skipped instantly for a cooldown period, then tested with a single probe request before traffic returns
 - `X-InferX-Backend`, `X-InferX-Route-Reason`, and `X-InferX-Fallback-From` response headers show which backend answered, why, and whether it was a fallback, including on failures
 - Structured JSON logs with one line per request: request ID, status, route decision, fallback, total latency, and backend latency
-- Request IDs on every log line, including retries and fallbacks, generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
+- Request IDs on every log line, including retries, fallbacks, and circuit breaker changes, generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
 - OpenAI-compatible HTTP backend that works with Ollama, vLLM, and hosted model APIs
 - Mock backend with simulated latency and forced failures (retryable or permanent), used for tests and CI
-- Strict config validation at startup: typos, unknown backend types, duplicate names, invalid retry or fallback settings, and missing API key variables are rejected before the server accepts traffic
+- Strict config validation at startup: typos, unknown backend types, duplicate names, invalid retry, fallback, or circuit breaker settings, and missing API key variables are rejected before the server accepts traffic
 - Clear errors: `422` for invalid requests, `404` for unknown models, `502` when backends fail (full details go to the server logs, not to the client)
 - `/health` endpoint and auto-generated OpenAPI docs
 - Automated tests with pytest, run in CI on every pull request
 
 ### Planned
 
-- Circuit breakers that stop sending traffic to a failing backend
 - An overall deadline for each request across retries and fallbacks
 - Streaming responses for the chat endpoint
 - Routing by cost budget and latency target
 - Smarter routing, evaluated against the length-based router as a baseline
 - Per-key rate limiting and response caching (Redis)
 - Usage and cost tracking (PostgreSQL)
-- Metrics and dashboards (Prometheus and Grafana)
+- Metrics and dashboards (Prometheus and Grafana), including circuit breaker states
 - Reproducible load tests and published benchmark results
 
 ## Quickstart
@@ -72,6 +72,39 @@ INFERX_CONFIG_PATH=config/ollama.toml uv run uvicorn inferx.app:app --reload --n
 
 Short prompts now go to `llama3.2:1b` and longer prompts to `llama3.2:3b`. If one model keeps failing, requests fall back to the other.
 
+## How failures are handled
+
+Each backend is wrapped in layers, from the outside in:
+
+```
+CircuitBreakerBackend  ->  RetryingBackend  ->  backend (Ollama, vLLM, mock, ...)
+```
+
+1. **Circuit breaker:** if the backend's circuit is open, fail immediately without calling it
+2. **Retries:** on a transient failure, wait (exponential backoff with full jitter) and try again, up to `max_attempts`
+3. **Fallback:** if the backend still fails with a transient error, the endpoint tries the next fallback backend
+
+Each layer only counts a failure as "unhealthy" if it's transient. Permanent failures (like a `400` caused by the request) are not retried, don't trigger fallback, and count as a healthy response for the circuit breaker, since the backend did respond.
+
+The circuit breaker has three states:
+
+- **closed:** requests go through, and consecutive failures are counted
+- **open:** after `failure_threshold` requests in a row fail (each after its retries), requests skip the backend for `cooldown_seconds`
+- **half-open:** after the cooldown, exactly one probe request is sent. If it succeeds the circuit closes; if it fails the circuit opens again
+
+## Observed behavior
+
+A manual run with `ollama-small` pointed at an unused port (so it always fails), retries with a `0.5` second base delay, and a circuit breaker that opens after 2 failures. Four identical short prompts were sent in a row:
+
+| Request | Time | What happened |
+|---|---|---|
+| 1 | 24.99 s | Retries on the failing backend, then fallback to `llama3.2:3b`, which was not loaded yet (cold start) |
+| 2 | 1.13 s | Retries on the failing backend, then fallback to the warm `llama3.2:3b`. The circuit opened after this request |
+| 3 | 0.15 s | Circuit open: the failing backend was skipped, straight to `llama3.2:3b` |
+| 4 | 0.18 s | Same as request 3 |
+
+Requests 2 to 4 are the fair comparison, since the model was warm for all of them. Request 1 is dominated by loading the model onto the GPU. This is a single run on one laptop (RTX 3060 Laptop GPU, 6 GB), not a benchmark; reproducible load tests are planned.
+
 ## Logs
 
 InferX writes JSON logs to the terminal, one object per line. Every log line written while handling a request includes that request's ID. Every request produces one `request completed` line, for example:
@@ -82,11 +115,12 @@ InferX writes JSON logs to the terminal, one object per line. Every log line wri
 
 `latency_ms` is the total time inside InferX, and `backend_latency_ms` is the time spent waiting on backends (including retries and fallbacks), so the difference is the gateway's own overhead. `backend` is the backend that answered, and `fallback_from` is the routed backend it replaced, if any.
 
-Other log lines under the same request ID:
+Other log lines:
 
 - `retrying backend request`: a transient failure is being retried, with the attempt number, the wait before the next attempt, and the backend's status code
-- `falling back to another backend`: a backend kept failing with transient errors, with the failing backend, the next one to try, and the full error
+- `falling back to another backend`: a backend kept failing with transient errors (or its circuit was open), with the failing backend, the next one to try, and the full error
 - `backend request failed`: the request failed for good, with the full error, whether it was `retryable`, and the backend's status code
+- `circuit breaker state changed`: a backend's circuit moved between `closed`, `open`, and `half_open`
 
 `--no-access-log` turns off Uvicorn's plain-text request lines, since the JSON request logs replace them.
 
@@ -99,7 +133,7 @@ InferX reads these environment variables:
 | `INFERX_CONFIG_PATH` | none | Path to a TOML config file. Without one, InferX uses two built-in mock backends. |
 | `INFERX_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 
-The config file lists the backends, the routing rules, and the retry policy. See [`config/ollama.toml`](config/ollama.toml) for a complete example.
+The config file lists the backends, the routing rules, the retry policy, and the circuit breaker settings. See [`config/ollama.toml`](config/ollama.toml) for a complete example.
 
 ```toml
 [routing]
@@ -112,6 +146,10 @@ fallback_backends = ["ollama-large", "ollama-small"]
 max_attempts = 3
 base_delay_seconds = 0.1
 max_delay_seconds = 2.0
+
+[circuit_breaker]
+failure_threshold = 5
+cooldown_seconds = 30.0
 
 [[backends]]
 type = "openai"
@@ -138,16 +176,22 @@ Retry settings (all optional, applied to every backend):
 
 Each wait is a random amount between zero and the current cap ("full jitter"), so retries from many requests spread out instead of arriving at the same moment.
 
+Circuit breaker settings (all optional, applied to every backend):
+
+- `failure_threshold`: consecutive failed requests (each after its retries) before the circuit opens (default 5)
+- `cooldown_seconds`: how long the circuit stays open before a probe request is allowed (default 30)
+
 API keys never go in the config file. Set `api_key_env` to the name of an environment variable, and InferX reads the key from that variable at startup.
 
 The `max_small_prompt_chars` threshold in the example is a starting guess, not a tuned value. Choosing it from measured cost and quality data is part of the planned benchmarks.
 
 ## Known limitations
 
-- **A failing backend is still tried on every request.** While a backend is down, each request routed to it waits through its retries before falling back. Circuit breakers (planned) will skip a backend that keeps failing.
 - **No overall request deadline yet.** Retries and fallbacks run inside a single request, so the worst case is roughly the number of backends tried, times `max_attempts`, times the backend timeout, plus backoff waits.
+- **Circuit breaker state is per process and in memory.** Several InferX instances each track backends separately, and a restart resets every circuit to closed.
+- **The circuit breaker counts consecutive failures.** A backend that fails intermittently (for example, every other request) never trips it. A failure rate over a time window would catch that case.
 - **Permanent failures don't fall back.** This is deliberate, so a misconfigured backend (like a bad API key) shows up as errors instead of silently shifting traffic, but it means some requests fail that another backend could have answered.
-- **One retry policy for all backends.** A hosted API might deserve different settings than a local model.
+- **One retry and circuit breaker policy for all backends.** A hosted API might deserve different settings than a local model.
 - **Retries can stack with other layers.** If clients and model servers also retry, attempts multiply. Keep `max_attempts` small.
 
 ## Running tests
@@ -156,7 +200,7 @@ The `max_small_prompt_chars` threshold in the example is a starting guess, not a
 uv run pytest -v
 ```
 
-Tests use mock backends, a mock HTTP transport, and a fake sleep function, so they never need a model server and never actually wait between retries.
+Tests use mock backends, a mock HTTP transport, a fake sleep function, and a fake clock, so they never need a model server and never actually wait.
 
 ## Project structure
 
@@ -166,6 +210,7 @@ inferx/
 │   └── ollama.toml               example config for two local Ollama models
 ├── src/inferx/
 │   ├── app.py                    FastAPI app, lifespan, middleware, routes, and fallback
+│   ├── circuit_breaker.py        circuit breaker state machine
 │   ├── config.py                 environment settings
 │   ├── gateway_config.py         config file models and builders
 │   ├── observability.py          JSON logging and request ID context
@@ -173,6 +218,7 @@ inferx/
 │   ├── schemas.py                request and response models
 │   └── backends/
 │       ├── base.py               backend interface and error type
+│       ├── circuit_breaking.py   circuit breaker wrapper
 │       ├── mock.py               mock backend for development and testing
 │       ├── openai_compatible.py  HTTP backend for OpenAI-compatible servers
 │       └── retrying.py           retry wrapper with backoff and jitter
