@@ -14,10 +14,12 @@ from importlib.metadata import version
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from starlette.routing import Match
 
 from inferx.backends.base import Backend, BackendError
 from inferx.config import Settings, load_gateway_config
 from inferx.gateway_config import build_backends, build_router
+from inferx.metrics import CONTENT_TYPE, UNMATCHED_ROUTE, Metrics
 from inferx.observability import configure_logging, reset_request_id, set_request_id
 from inferx.router import LengthRouter, UnknownModelError
 from inferx.schemas import ChatCompletionRequest, ChatCompletionResponse
@@ -32,6 +34,10 @@ REQUEST_ID_HEADER = "X-Request-ID"
 # so it can't be used to inject fake entries into the logs.
 _VALID_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
+# Called constantly by Docker and Prometheus. Logged at DEBUG so they don't
+# drown out real traffic in the logs. They're still counted in the metrics.
+_PROBE_PATHS = frozenset({"/health", "/metrics"})
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +51,19 @@ def get_or_create_request_id(incoming: str | None) -> str:
     if incoming and _VALID_REQUEST_ID.fullmatch(incoming):
         return incoming
     return uuid.uuid4().hex
+
+
+def route_template(request: Request) -> str:
+    """The route's path template, like "/v1/chat/completions".
+
+    Metrics are labeled with this instead of the raw URL, so requests to
+    random paths all count as one "unmatched" series.
+    """
+    for route in request.app.routes:
+        match, _ = route.matches(request.scope)
+        if match is Match.FULL:
+            return route.path
+    return UNMATCHED_ROUTE
 
 
 def routing_headers(backend: str, reason: str, fallback_from: str | None) -> dict[str, str]:
@@ -70,6 +89,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.router = build_router(gateway_config)
     app.state.backends = build_backends(gateway_config)
     app.state.request_timeout_seconds = gateway_config.limits.request_timeout_seconds
+    app.state.metrics = Metrics()
     logger.info(
         "inferx started",
         extra={
@@ -101,7 +121,7 @@ async def log_requests(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """Give every request an ID and write one log line when it finishes."""
+    """Give every request an ID, record its metrics, and log it when it finishes."""
     request_id = get_or_create_request_id(request.headers.get(REQUEST_ID_HEADER))
     request.state.request_id = request_id
 
@@ -110,15 +130,30 @@ async def log_requests(
     try:
         start = time.perf_counter()
         response = await call_next(request)
+        duration_seconds = time.perf_counter() - start
 
         response.headers[REQUEST_ID_HEADER] = request_id
-        logger.info(
+
+        route = route_template(request)
+        metrics: Metrics = request.app.state.metrics
+        metrics.http_requests.labels(
+            method=request.method,
+            route=route,
+            status=str(response.status_code),
+        ).inc()
+        metrics.http_request_duration.labels(method=request.method, route=route).observe(
+            duration_seconds
+        )
+
+        level = logging.DEBUG if request.url.path in _PROBE_PATHS else logging.INFO
+        logger.log(
+            level,
             "request completed",
             extra={
                 "method": request.method,
                 "path": request.url.path,
                 "status": response.status_code,
-                "latency_ms": elapsed_ms(start),
+                "latency_ms": round(duration_seconds * 1000, 2),
                 # Set by the chat endpoint. Other routes leave these empty.
                 "backend": getattr(request.state, "backend", None),
                 "route_reason": getattr(request.state, "route_reason", None),
@@ -158,6 +193,13 @@ def health() -> dict[str, str]:
     to check whether the service is alive.
     """
     return {"status": "ok", "version": APP_VERSION}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics_endpoint(request: Request) -> Response:
+    """Current metrics in Prometheus's text format, for Prometheus to scrape."""
+    metrics: Metrics = request.app.state.metrics
+    return Response(content=metrics.render(), media_type=CONTENT_TYPE)
 
 
 @app.post("/v1/chat/completions")
