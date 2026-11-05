@@ -1,0 +1,38 @@
+# InferX and Prometheus, running together on one private network.
+#
+#   docker compose up --build -d
+#
+# InferX:     http://127.0.0.1:8000
+# Prometheus: http://127.0.0.1:9090
+
+name: inferx
+
+services:
+  inferx:
+    build: .
+    image: inferx:dev
+    environment:
+      INFERX_CONFIG_PATH: config/compose-demo.toml
+    ports:
+      # Published only to this machine, not to the whole network.
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  prometheus:
+    # Pinned to a version with recent security fixes.
+    image: prom/prometheus:v3.11.3
+    volumes:
+      # The config file from this repo, read-only inside the container.
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Metric history, kept in a named volume so it survives restarts.
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      # Wait for InferX's health check to pass before starting.
+      inferx:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
