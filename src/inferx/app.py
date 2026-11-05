@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from inferx.backends.base import Backend, BackendError
 from inferx.config import Settings, load_gateway_config
 from inferx.gateway_config import build_backends, build_router
-from inferx.observability import configure_logging
+from inferx.observability import configure_logging, reset_request_id, set_request_id
 from inferx.router import LengthRouter, UnknownModelError
 from inferx.schemas import ChatCompletionRequest, ChatCompletionResponse
 
@@ -85,26 +85,30 @@ async def log_requests(
     """Give every request an ID and write one log line when it finishes."""
     request_id = get_or_create_request_id(request.headers.get(REQUEST_ID_HEADER))
     request.state.request_id = request_id
-    start = time.perf_counter()
 
-    response = await call_next(request)
+    # Every log line written while handling this request gets this ID.
+    token = set_request_id(request_id)
+    try:
+        start = time.perf_counter()
+        response = await call_next(request)
 
-    response.headers[REQUEST_ID_HEADER] = request_id
-    logger.info(
-        "request completed",
-        extra={
-            "request_id": request_id,
-            "method": request.method,
-            "path": request.url.path,
-            "status": response.status_code,
-            "latency_ms": elapsed_ms(start),
-            # Set by the chat endpoint. Other routes leave these empty.
-            "backend": getattr(request.state, "backend", None),
-            "route_reason": getattr(request.state, "route_reason", None),
-            "backend_latency_ms": getattr(request.state, "backend_latency_ms", None),
-        },
-    )
-    return response
+        response.headers[REQUEST_ID_HEADER] = request_id
+        logger.info(
+            "request completed",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "latency_ms": elapsed_ms(start),
+                # Set by the chat endpoint. Other routes leave these empty.
+                "backend": getattr(request.state, "backend", None),
+                "route_reason": getattr(request.state, "route_reason", None),
+                "backend_latency_ms": getattr(request.state, "backend_latency_ms", None),
+            },
+        )
+        return response
+    finally:
+        reset_request_id(token)
 
 
 def get_router(request: Request) -> LengthRouter:
@@ -169,7 +173,6 @@ async def chat_completions(
             "backend request failed",
             exc_info=True,
             extra={
-                "request_id": http_request.state.request_id,
                 "backend": decision.backend,
                 "retryable": error.retryable,
                 "backend_status_code": error.status_code,

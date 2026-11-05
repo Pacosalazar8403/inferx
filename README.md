@@ -15,23 +15,24 @@ InferX sits between client applications and multiple language model backends. Ea
 - OpenAI-compatible `POST /v1/chat/completions` endpoint (subset of the format)
 - Multiple backends at once, described in a TOML config file
 - Length-based router: with `"model": "auto"`, short prompts go to a small backend and long prompts go to a large one; clients can also name a backend directly
+- Retries with exponential backoff and full jitter for transient failures (timeouts, connection errors, `408`, `429`, `5xx`); permanent failures (other `4xx`, malformed responses) are never retried
 - `X-InferX-Backend` and `X-InferX-Route-Reason` response headers on every request, including failures
 - Structured JSON logs with one line per request: request ID, status, route decision, total latency, and backend latency
-- Request IDs: generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
+- Request IDs on every log line, including retries, generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
 - OpenAI-compatible HTTP backend that works with Ollama, vLLM, and hosted model APIs
-- Mock backend with simulated latency and forced failures (retryable or permanent), used for tests and CI
-- Strict config validation at startup: typos, unknown backend types, duplicate names, and missing API key variables are rejected before the server accepts traffic
+- Mock backend with simulated latency and forced failures, used for tests and CI
+- Strict config validation at startup: typos, unknown backend types, duplicate names, invalid retry settings, and missing API key variables are rejected before the server accepts traffic
 - Clear errors: `422` for invalid requests, `404` for unknown models, `502` when a backend fails (full details go to the server logs, not to the client)
-- Backend failures classified as retryable (timeouts, connection errors, `408`, `429`, `5xx`) or permanent (other `4xx`, malformed responses), and logged with the backend's status code
 - `/health` endpoint and auto-generated OpenAPI docs
 - Automated tests with pytest, run in CI on every pull request
 
 ### Planned
 
+- Fallback to another backend when one fails
+- Circuit breakers that stop sending traffic to a failing backend
 - Streaming responses for the chat endpoint
 - Routing by cost budget and latency target
 - Smarter routing, evaluated against the length-based router as a baseline
-- Retries with backoff, fallback to another backend, and circuit breakers
 - Per-key rate limiting and response caching (Redis)
 - Usage and cost tracking (PostgreSQL)
 - Metrics and dashboards (Prometheus and Grafana)
@@ -72,13 +73,18 @@ Short prompts now go to `llama3.2:1b` and longer prompts to `llama3.2:3b`.
 
 ## Logs
 
-InferX writes JSON logs to the terminal, one object per line. Every request produces one `request completed` line, for example:
+InferX writes JSON logs to the terminal, one object per line. Every log line written while handling a request includes that request's ID. Every request produces one `request completed` line, for example:
 
 ```json
 {"timestamp": "2026-11-04T23:24:02.285421+00:00", "level": "INFO", "logger": "inferx.app", "message": "request completed", "request_id": "juan-test-002", "method": "POST", "path": "/v1/chat/completions", "status": 200, "latency_ms": 269.69, "backend": "ollama-small", "route_reason": "short_prompt", "backend_latency_ms": 267.84}
 ```
 
-`latency_ms` is the total time inside InferX, and `backend_latency_ms` is the time spent waiting on the model, so the difference is the gateway's own overhead. When a backend fails, a `backend request failed` warning is logged under the same request ID, with the full error, whether it was `retryable`, and the backend's status code.
+`latency_ms` is the total time inside InferX, and `backend_latency_ms` is the time spent waiting on the backend (including retries), so the difference is the gateway's own overhead.
+
+Other log lines under the same request ID:
+
+- `retrying backend request`: a transient failure is being retried, with the attempt number, the wait before the next attempt, and the backend's status code
+- `backend request failed`: the request failed after any retries, with the full error, whether it was `retryable`, and the backend's status code
 
 `--no-access-log` turns off Uvicorn's plain-text request lines, since the JSON request logs replace them.
 
@@ -91,13 +97,18 @@ InferX reads these environment variables:
 | `INFERX_CONFIG_PATH` | none | Path to a TOML config file. Without one, InferX uses two built-in mock backends. |
 | `INFERX_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 
-The config file lists the backends and the routing rules. See [`config/ollama.toml`](config/ollama.toml) for a complete example.
+The config file lists the backends, the routing rules, and the retry policy. See [`config/ollama.toml`](config/ollama.toml) for a complete example.
 
 ```toml
 [routing]
 small_backend = "ollama-small"
 large_backend = "ollama-large"
 max_small_prompt_chars = 200
+
+[retry]
+max_attempts = 3
+base_delay_seconds = 0.1
+max_delay_seconds = 2.0
 
 [[backends]]
 type = "openai"
@@ -108,12 +119,26 @@ model = "llama3.2:1b"
 
 Backend types:
 
-- `mock`: fields `name`, optional `latency_seconds`
+- `mock`: fields `name`, optional `latency_seconds`, optional `fail`
 - `openai`: fields `name`, `base_url`, `model`, optional `timeout_seconds` (default 30), optional `api_key_env`
+
+Retry settings (all optional, applied to every backend):
+
+- `max_attempts`: total attempts including the first, from 1 to 10 (default 3)
+- `base_delay_seconds`: the first backoff cap (default 0.1); each later cap doubles
+- `max_delay_seconds`: the largest backoff cap (default 2.0)
+
+Each wait is a random amount between zero and the current cap ("full jitter"), so retries from many requests spread out instead of arriving at the same moment.
 
 API keys never go in the config file. Set `api_key_env` to the name of an environment variable, and InferX reads the key from that variable at startup.
 
 The `max_small_prompt_chars` threshold in the example is a starting guess, not a tuned value. Choosing it from measured cost and quality data is part of the planned benchmarks.
+
+## Known limitations
+
+- **No overall request deadline yet.** Retries run inside a single request, so the worst case is roughly `max_attempts` times the backend timeout, plus backoff waits. With the defaults, that can exceed 90 seconds against a backend that keeps timing out.
+- **One retry policy for all backends.** A hosted API might deserve different settings than a local model.
+- **Retries can stack with other layers.** If clients and model servers also retry, attempts multiply. Keep `max_attempts` small.
 
 ## Running tests
 
@@ -121,7 +146,7 @@ The `max_small_prompt_chars` threshold in the example is a starting guess, not a
 uv run pytest -v
 ```
 
-Tests use mock backends and a mock HTTP transport, so they never need a model server.
+Tests use mock backends, a mock HTTP transport, and a fake sleep function, so they never need a model server and never actually wait between retries.
 
 ## Project structure
 
@@ -133,13 +158,14 @@ inferx/
 │   ├── app.py                    FastAPI app, lifespan, middleware, and routes
 │   ├── config.py                 environment settings
 │   ├── gateway_config.py         config file models and builders
-│   ├── observability.py          JSON log formatting and setup
+│   ├── observability.py          JSON logging and request ID context
 │   ├── router.py                 length-based router
 │   ├── schemas.py                request and response models
 │   └── backends/
 │       ├── base.py               backend interface and error type
 │       ├── mock.py               mock backend for development and testing
-│       └── openai_compatible.py  HTTP backend for OpenAI-compatible servers
+│       ├── openai_compatible.py  HTTP backend for OpenAI-compatible servers
+│       └── retrying.py           retry wrapper with backoff and jitter
 ├── tests/                        automated tests (shared fixtures in conftest.py)
 ├── .github/workflows/            CI pipeline
 ├── pyproject.toml                project metadata and dependencies
