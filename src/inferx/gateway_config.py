@@ -1,5 +1,5 @@
 """Gateway configuration: which backends exist, how requests are routed,
-and how failures are retried and contained.
+how failures are retried and contained, and how long a request may take.
 
 Loaded from a TOML file so several backends can be described in one place.
 Secrets never go in this file: a backend names the environment variable
@@ -100,6 +100,19 @@ class CircuitBreakerConfig(BaseModel):
     cooldown_seconds: float = Field(default=30.0, gt=0)
 
 
+class LimitsConfig(BaseModel):
+    """Limits on how long a single request may take.
+
+    request_timeout_seconds is a total budget for the whole request, across
+    every retry, backoff wait, and fallback. The default leaves room for a
+    model's cold start, which was observed at about 25 seconds locally.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+
+
 class GatewayConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -107,6 +120,7 @@ class GatewayConfig(BaseModel):
     routing: RoutingConfig
     retry: RetryConfig = Field(default_factory=RetryConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
+    limits: LimitsConfig = Field(default_factory=LimitsConfig)
 
     @model_validator(mode="after")
     def check_backend_names_are_unique(self) -> "GatewayConfig":
@@ -114,6 +128,21 @@ class GatewayConfig(BaseModel):
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
             raise ValueError(f"duplicate backend names: {duplicates}")
+        return self
+
+    @model_validator(mode="after")
+    def check_backend_timeouts_fit_the_request_deadline(self) -> "GatewayConfig":
+        deadline = self.limits.request_timeout_seconds
+        too_slow = sorted(
+            backend.name
+            for backend in self.backends
+            if isinstance(backend, OpenAIBackendConfig) and backend.timeout_seconds > deadline
+        )
+        if too_slow:
+            raise ValueError(
+                f"backends {too_slow} have a timeout_seconds longer than "
+                f"request_timeout_seconds ({deadline}), so a slow attempt could never finish"
+            )
         return self
 
 
