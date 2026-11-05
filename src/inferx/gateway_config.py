@@ -19,6 +19,7 @@ from inferx.backends.mock import MockBackend
 from inferx.backends.openai_compatible import OpenAICompatibleBackend
 from inferx.backends.retrying import RetryingBackend, RetryPolicy
 from inferx.circuit_breaker import CircuitBreaker
+from inferx.metrics import Metrics
 from inferx.router import LengthRouter
 
 
@@ -195,16 +196,25 @@ def build_backend(config: MockBackendConfig | OpenAIBackendConfig) -> Backend:
     )
 
 
-def build_backends(config: GatewayConfig) -> dict[str, Backend]:
+def build_backends(config: GatewayConfig, metrics: Metrics | None = None) -> dict[str, Backend]:
     """Create every configured backend with retries and a circuit breaker.
 
     The breaker wraps the retries, so one breaker failure means one request
-    that still failed after all of its retries.
+    that still failed after all of its retries. If metrics are given, every
+    retry is counted per backend.
     """
     policy = config.retry.to_policy()
     backends: dict[str, Backend] = {}
     for backend_config in config.backends:
-        retrying = RetryingBackend(build_backend(backend_config), policy)
+        # Look up this backend's retry counter now, inside the loop. A lambda
+        # here would look up the name only when called, after the loop ended,
+        # and every backend would count its retries under the last name.
+        on_retry = (
+            metrics.backend_retries.labels(backend=backend_config.name).inc
+            if metrics is not None
+            else None
+        )
+        retrying = RetryingBackend(build_backend(backend_config), policy, on_retry=on_retry)
         breaker = CircuitBreaker(
             name=backend_config.name,
             failure_threshold=config.circuit_breaker.failure_threshold,

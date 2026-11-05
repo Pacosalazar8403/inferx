@@ -19,6 +19,7 @@ InferX sits between client applications and multiple language model backends. Ea
 - Fallback to other backends, in a configured order, when the routed backend keeps failing with transient errors (only for `"auto"` requests)
 - Circuit breakers per backend: after repeated failures, a backend is skipped instantly for a cooldown period, then tested with a single probe request before traffic returns
 - A total time budget per request across retries, backoff waits, and fallbacks; when it runs out, in-progress work is cancelled and the client gets a `504`
+- Prometheus metrics at `/metrics`: request rate and latency histograms, backend outcomes, retries, fallbacks, deadlines, and current circuit breaker states
 - `X-InferX-Backend`, `X-InferX-Route-Reason`, and `X-InferX-Fallback-From` response headers show which backend answered, why, and whether it was a fallback, including on failures
 - Structured JSON logs with one line per request: request ID, status, route decision, fallback, total latency, and backend latency
 - Request IDs on every log line, including retries, fallbacks, circuit breaker changes, and deadlines, generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
@@ -32,13 +33,13 @@ InferX sits between client applications and multiple language model backends. Ea
 
 ### Planned
 
-- Docker Compose setup with Ollama in its own container
+- Docker Compose setup with Prometheus scraping InferX, and Ollama in its own container
+- Grafana dashboards for the metrics
 - Streaming responses for the chat endpoint
 - Routing by cost budget and latency target
 - Smarter routing, evaluated against the length-based router as a baseline
 - Per-key rate limiting and response caching (Redis)
 - Usage and cost tracking (PostgreSQL)
-- Metrics and dashboards (Prometheus and Grafana), including circuit breaker states
 - Reproducible load tests and published benchmark results
 
 ## Quickstart
@@ -60,7 +61,7 @@ curl -s -i http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model": "auto", "messages": [{"role": "user", "content": "Hello InferX"}]}'
 ```
 
-The `x-inferx-backend`, `x-inferx-route-reason`, and `x-request-id` headers show which backend handled the request, why, and the ID to search for in the logs. Interactive API docs are available at http://127.0.0.1:8000/docs.
+The `x-inferx-backend`, `x-inferx-route-reason`, and `x-request-id` headers show which backend handled the request, why, and the ID to search for in the logs. Interactive API docs are available at http://127.0.0.1:8000/docs, and metrics at http://127.0.0.1:8000/metrics.
 
 ### Using real models with Ollama
 
@@ -148,6 +149,37 @@ A manual run with `ollama-small` pointed at an unused port (so it always fails),
 | 4 | 0.18 s | Same as request 3 |
 
 Requests 2 to 4 are the fair comparison, since the model was warm for all of them. Request 1 is dominated by loading the model onto the GPU. This is a single run on one laptop (RTX 3060 Laptop GPU, 6 GB), not a benchmark; reproducible load tests are planned.
+
+## Metrics
+
+`GET /metrics` serves metrics in Prometheus's text format:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `inferx_http_requests_total` | counter | `method`, `route`, `status` | HTTP requests handled |
+| `inferx_http_request_duration_seconds` | histogram | `method`, `route` | Time to handle each request |
+| `inferx_backend_attempts_total` | counter | `backend`, `outcome` | Requests sent to each backend (after its retries), by `success`, `retryable_failure`, `permanent_failure`, or `circuit_open` |
+| `inferx_backend_retries_total` | counter | `backend` | Retries of transient failures |
+| `inferx_fallbacks_total` | counter | `from_backend`, `to_backend` | Requests moved to another backend |
+| `inferx_deadline_exceeded_total` | counter | `backend` | Requests that ran out of their time budget |
+| `inferx_circuit_breaker_state` | gauge | `backend`, `state` | `1` for each backend's current circuit state (`closed`, `open`, `half_open`), `0` for the others |
+
+Labels only ever hold a small, fixed set of values. Requests to unknown paths are counted under `route="unmatched"` rather than their raw path, so random URLs can't create unlimited time series. The latency buckets span 10 milliseconds to 60 seconds, since model requests range from milliseconds to a cold start of about 25 seconds.
+
+Example Prometheus queries:
+
+```promql
+# Requests per second over the last 5 minutes, by status
+sum by (status) (rate(inferx_http_requests_total[5m]))
+
+# p95 latency of chat requests
+histogram_quantile(0.95, sum by (le) (rate(inferx_http_request_duration_seconds_bucket{route="/v1/chat/completions"}[5m])))
+
+# Backends whose circuit is open right now
+inferx_circuit_breaker_state{state="open"} == 1
+```
+
+`/health` and `/metrics` requests are counted in the metrics but logged at `DEBUG`, so frequent health checks and scrapes don't flood the logs.
 
 ## Logs
 
@@ -244,6 +276,8 @@ The `max_small_prompt_chars` threshold in the example is a starting guess, not a
 - **Retries don't know the remaining time budget.** A retry can start even when it can't finish before the deadline, and is then cancelled. Passing the remaining budget down so retries can skip themselves (deadline propagation) would avoid that wasted work.
 - **Circuit breaker state is per process and in memory.** Several InferX instances each track backends separately, and a restart resets every circuit to closed.
 - **The circuit breaker counts consecutive failures.** A backend that fails intermittently (for example, every other request) never trips it. A failure rate over a time window would catch that case.
+- **The circuit breaker metric shows the last known state.** A circuit only moves from `open` to `half_open` when a request arrives after its cooldown, so with no traffic, the metric keeps reporting `open`.
+- **`/metrics` has no authentication.** Metrics reveal backend names and traffic patterns. If InferX is ever exposed beyond a private network, `/metrics` should be restricted, for example to the monitoring network only.
 - **Permanent failures don't fall back.** This is deliberate, so a misconfigured backend (like a bad API key) shows up as errors instead of silently shifting traffic, but it means some requests fail that another backend could have answered.
 - **One retry and circuit breaker policy for all backends.** A hosted API might deserve different settings than a local model.
 - **Retries can stack with other layers.** If clients and model servers also retry, attempts multiply. Keep `max_attempts` small.
@@ -255,7 +289,7 @@ The `max_small_prompt_chars` threshold in the example is a starting guess, not a
 uv run pytest -v
 ```
 
-Tests use mock backends, a mock HTTP transport, a fake sleep function, and a fake clock, so they never need a model server. The deadline tests use short real timeouts (about 0.2 seconds) to check that cancellation really happens.
+Tests use mock backends, a mock HTTP transport, a fake sleep function, and a fake clock, so they never need a model server. The deadline tests use short real timeouts (about 0.2 seconds) to check that cancellation really happens. Each app gets its own metrics registry, so metric tests always start from zero.
 
 CI also builds the Docker image, starts a container, waits for `/health`, and checks that it runs as a non-root user.
 
@@ -270,6 +304,7 @@ inferx/
 │   ├── circuit_breaker.py        circuit breaker state machine
 │   ├── config.py                 environment settings
 │   ├── gateway_config.py         config file models and builders
+│   ├── metrics.py                Prometheus metrics and the circuit breaker collector
 │   ├── observability.py          JSON logging and request ID context
 │   ├── router.py                 length-based router and fallback order
 │   ├── schemas.py                request and response models
@@ -289,4 +324,4 @@ inferx/
 
 ## Tech stack
 
-Python 3.12, FastAPI, Uvicorn, Pydantic, pydantic-settings, httpx2, pytest, uv, Docker, Ollama, GitHub Actions
+Python 3.12, FastAPI, Uvicorn, Pydantic, pydantic-settings, httpx2, prometheus-client, pytest, uv, Docker, Ollama, GitHub Actions
