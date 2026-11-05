@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 SleepFunction = Callable[[float], Awaitable[None]]
 RandomFunction = Callable[[], float]
+RetryCallback = Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,11 @@ class RetryPolicy:
 
 
 class RetryingBackend(Backend):
-    """A backend that retries another backend's retryable failures."""
+    """A backend that retries another backend's retryable failures.
+
+    on_retry, if given, is called once for every retry. It lets other code
+    (like metrics) count retries without this class knowing about it.
+    """
 
     def __init__(
         self,
@@ -64,12 +69,14 @@ class RetryingBackend(Backend):
         policy: RetryPolicy,
         sleep: SleepFunction = asyncio.sleep,
         random_fraction: RandomFunction = random.random,
+        on_retry: RetryCallback | None = None,
     ) -> None:
         self.name = inner.name
         self._inner = inner
         self._policy = policy
         self._sleep = sleep
         self._random_fraction = random_fraction
+        self._on_retry = on_retry
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         attempt = 1
@@ -92,6 +99,8 @@ class RetryingBackend(Backend):
                         "backend_status_code": error.status_code,
                     },
                 )
+                if self._on_retry is not None:
+                    self._on_retry()
                 await self._sleep(delay)
                 attempt += 1
 
