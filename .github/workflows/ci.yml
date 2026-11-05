@@ -1,12 +1,12 @@
 name: CI
 
-# when to run: on every push to main, and on every pull request.
+# When to run: on every push to main, and on every pull request.
 on:
   push:
     branches: [main]
   pull_request:
 
-# give the workflow read-only access to the repo (least privilege).
+# Give the workflow read-only access to the repo (least privilege).
 permissions:
   contents: read
 
@@ -29,3 +29,35 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -v
+
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build -t inferx:ci .
+
+      - name: Start a container
+        run: docker run -d --name inferx -p 127.0.0.1:8000:8000 inferx:ci
+
+      - name: Wait for the health check
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "InferX did not become healthy within 30 seconds"
+          docker logs inferx
+          exit 1
+
+      - name: Check it runs as a non-root user
+        run: test "$(docker exec inferx whoami)" = "inferx"
+
+      - name: Show container logs
+        if: always()
+        run: docker logs inferx
