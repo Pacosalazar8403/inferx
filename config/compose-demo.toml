@@ -1,0 +1,34 @@
+# Mock backends for the Docker Compose demo. No model server needed.
+#
+# - "small" is fast and "large" is slower, so latency differs by route.
+# - "broken" always fails, and is only used when a request names it, so the
+#   demo shows retries, 502s, and its circuit opening.
+
+[routing]
+small_backend = "small"
+large_backend = "large"
+max_small_prompt_chars = 200
+
+[retry]
+max_attempts = 3
+base_delay_seconds = 0.05
+max_delay_seconds = 0.2
+
+[circuit_breaker]
+failure_threshold = 5
+cooldown_seconds = 30.0
+
+[[backends]]
+type = "mock"
+name = "small"
+latency_seconds = 0.05
+
+[[backends]]
+type = "mock"
+name = "large"
+latency_seconds = 0.4
+
+[[backends]]
+type = "mock"
+name = "broken"
+fail = true
