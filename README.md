@@ -16,20 +16,21 @@ InferX sits between client applications and multiple language model backends. Ea
 - Multiple backends at once, described in a TOML config file
 - Length-based router: with `"model": "auto"`, short prompts go to a small backend and long prompts go to a large one; clients can also name a backend directly
 - Retries with exponential backoff and full jitter for transient failures (timeouts, connection errors, `408`, `429`, `5xx`); permanent failures (other `4xx`, malformed responses) are never retried
-- `X-InferX-Backend` and `X-InferX-Route-Reason` response headers on every request, including failures
-- Structured JSON logs with one line per request: request ID, status, route decision, total latency, and backend latency
-- Request IDs on every log line, including retries, generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
+- Fallback to other backends, in a configured order, when the routed backend keeps failing with transient errors (only for `"auto"` requests)
+- `X-InferX-Backend`, `X-InferX-Route-Reason`, and `X-InferX-Fallback-From` response headers show which backend answered, why, and whether it was a fallback, including on failures
+- Structured JSON logs with one line per request: request ID, status, route decision, fallback, total latency, and backend latency
+- Request IDs on every log line, including retries and fallbacks, generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
 - OpenAI-compatible HTTP backend that works with Ollama, vLLM, and hosted model APIs
-- Mock backend with simulated latency and forced failures, used for tests and CI
-- Strict config validation at startup: typos, unknown backend types, duplicate names, invalid retry settings, and missing API key variables are rejected before the server accepts traffic
-- Clear errors: `422` for invalid requests, `404` for unknown models, `502` when a backend fails (full details go to the server logs, not to the client)
+- Mock backend with simulated latency and forced failures (retryable or permanent), used for tests and CI
+- Strict config validation at startup: typos, unknown backend types, duplicate names, invalid retry or fallback settings, and missing API key variables are rejected before the server accepts traffic
+- Clear errors: `422` for invalid requests, `404` for unknown models, `502` when backends fail (full details go to the server logs, not to the client)
 - `/health` endpoint and auto-generated OpenAPI docs
 - Automated tests with pytest, run in CI on every pull request
 
 ### Planned
 
-- Fallback to another backend when one fails
 - Circuit breakers that stop sending traffic to a failing backend
+- An overall deadline for each request across retries and fallbacks
 - Streaming responses for the chat endpoint
 - Routing by cost budget and latency target
 - Smarter routing, evaluated against the length-based router as a baseline
@@ -69,22 +70,23 @@ ollama pull llama3.2:3b
 INFERX_CONFIG_PATH=config/ollama.toml uv run uvicorn inferx.app:app --reload --no-access-log
 ```
 
-Short prompts now go to `llama3.2:1b` and longer prompts to `llama3.2:3b`.
+Short prompts now go to `llama3.2:1b` and longer prompts to `llama3.2:3b`. If one model keeps failing, requests fall back to the other.
 
 ## Logs
 
 InferX writes JSON logs to the terminal, one object per line. Every log line written while handling a request includes that request's ID. Every request produces one `request completed` line, for example:
 
 ```json
-{"timestamp": "2026-11-04T23:24:02.285421+00:00", "level": "INFO", "logger": "inferx.app", "message": "request completed", "request_id": "juan-test-002", "method": "POST", "path": "/v1/chat/completions", "status": 200, "latency_ms": 269.69, "backend": "ollama-small", "route_reason": "short_prompt", "backend_latency_ms": 267.84}
+{"timestamp": "2026-11-04T23:24:02.285421+00:00", "level": "INFO", "logger": "inferx.app", "message": "request completed", "request_id": "juan-test-002", "method": "POST", "path": "/v1/chat/completions", "status": 200, "latency_ms": 269.69, "backend": "ollama-small", "route_reason": "short_prompt", "fallback_from": null, "backend_latency_ms": 267.84}
 ```
 
-`latency_ms` is the total time inside InferX, and `backend_latency_ms` is the time spent waiting on the backend (including retries), so the difference is the gateway's own overhead.
+`latency_ms` is the total time inside InferX, and `backend_latency_ms` is the time spent waiting on backends (including retries and fallbacks), so the difference is the gateway's own overhead. `backend` is the backend that answered, and `fallback_from` is the routed backend it replaced, if any.
 
 Other log lines under the same request ID:
 
 - `retrying backend request`: a transient failure is being retried, with the attempt number, the wait before the next attempt, and the backend's status code
-- `backend request failed`: the request failed after any retries, with the full error, whether it was `retryable`, and the backend's status code
+- `falling back to another backend`: a backend kept failing with transient errors, with the failing backend, the next one to try, and the full error
+- `backend request failed`: the request failed for good, with the full error, whether it was `retryable`, and the backend's status code
 
 `--no-access-log` turns off Uvicorn's plain-text request lines, since the JSON request logs replace them.
 
@@ -104,6 +106,7 @@ The config file lists the backends, the routing rules, and the retry policy. See
 small_backend = "ollama-small"
 large_backend = "ollama-large"
 max_small_prompt_chars = 200
+fallback_backends = ["ollama-large", "ollama-small"]
 
 [retry]
 max_attempts = 3
@@ -119,8 +122,13 @@ model = "llama3.2:1b"
 
 Backend types:
 
-- `mock`: fields `name`, optional `latency_seconds`, optional `fail`
+- `mock`: fields `name`, optional `latency_seconds`, optional `fail`, optional `retryable_failures` (default true)
 - `openai`: fields `name`, `base_url`, `model`, optional `timeout_seconds` (default 30), optional `api_key_env`
+
+Routing settings:
+
+- `small_backend`, `large_backend`, `max_small_prompt_chars`: where `"auto"` requests go, by prompt length
+- `fallback_backends` (optional): backends to try, in order, when the routed backend keeps failing with transient errors. The routed backend is skipped. Leave it out to disable fallback.
 
 Retry settings (all optional, applied to every backend):
 
@@ -136,7 +144,9 @@ The `max_small_prompt_chars` threshold in the example is a starting guess, not a
 
 ## Known limitations
 
-- **No overall request deadline yet.** Retries run inside a single request, so the worst case is roughly `max_attempts` times the backend timeout, plus backoff waits. With the defaults, that can exceed 90 seconds against a backend that keeps timing out.
+- **A failing backend is still tried on every request.** While a backend is down, each request routed to it waits through its retries before falling back. Circuit breakers (planned) will skip a backend that keeps failing.
+- **No overall request deadline yet.** Retries and fallbacks run inside a single request, so the worst case is roughly the number of backends tried, times `max_attempts`, times the backend timeout, plus backoff waits.
+- **Permanent failures don't fall back.** This is deliberate, so a misconfigured backend (like a bad API key) shows up as errors instead of silently shifting traffic, but it means some requests fail that another backend could have answered.
 - **One retry policy for all backends.** A hosted API might deserve different settings than a local model.
 - **Retries can stack with other layers.** If clients and model servers also retry, attempts multiply. Keep `max_attempts` small.
 
@@ -155,11 +165,11 @@ inferx/
 ├── config/
 │   └── ollama.toml               example config for two local Ollama models
 ├── src/inferx/
-│   ├── app.py                    FastAPI app, lifespan, middleware, and routes
+│   ├── app.py                    FastAPI app, lifespan, middleware, routes, and fallback
 │   ├── config.py                 environment settings
 │   ├── gateway_config.py         config file models and builders
 │   ├── observability.py          JSON logging and request ID context
-│   ├── router.py                 length-based router
+│   ├── router.py                 length-based router and fallback order
 │   ├── schemas.py                request and response models
 │   └── backends/
 │       ├── base.py               backend interface and error type

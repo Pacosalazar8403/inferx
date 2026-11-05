@@ -27,6 +27,7 @@ class MockBackendConfig(BaseModel):
     name: str = Field(min_length=1)
     latency_seconds: float = Field(default=0.0, ge=0)
     fail: bool = False
+    retryable_failures: bool = True
 
 
 class OpenAIBackendConfig(BaseModel):
@@ -53,6 +54,8 @@ class RoutingConfig(BaseModel):
     small_backend: str
     large_backend: str
     max_small_prompt_chars: int = Field(gt=0)
+    # Backends to try, in order, when the routed backend keeps failing.
+    fallback_backends: list[str] = Field(default_factory=list)
 
 
 class RetryConfig(BaseModel):
@@ -126,6 +129,7 @@ def build_backend(config: MockBackendConfig | OpenAIBackendConfig) -> Backend:
             name=config.name,
             latency_seconds=config.latency_seconds,
             fail=config.fail,
+            retryable_failures=config.retryable_failures,
         )
 
     api_key = None
@@ -162,4 +166,5 @@ def build_router(config: GatewayConfig) -> LengthRouter:
         large_backend=config.routing.large_backend,
         max_small_prompt_chars=config.routing.max_small_prompt_chars,
         available_backends={backend.name for backend in config.backends},
+        fallback_backends=config.routing.fallback_backends,
     )
