@@ -51,11 +51,23 @@ async def test_waits_for_configured_latency() -> None:
 
 
 @pytest.mark.anyio
-async def test_raises_backend_error_when_configured_to_fail() -> None:
+async def test_forced_failure_is_retryable_by_default() -> None:
     backend = MockBackend(name="broken", fail=True)
 
-    with pytest.raises(BackendError, match="broken"):
+    with pytest.raises(BackendError, match="broken") as caught:
         await backend.complete(make_request())
+
+    assert caught.value.retryable is True
+
+
+@pytest.mark.anyio
+async def test_forced_failure_can_be_permanent() -> None:
+    backend = MockBackend(name="broken", fail=True, retryable_failures=False)
+
+    with pytest.raises(BackendError) as caught:
+        await backend.complete(make_request())
+
+    assert caught.value.retryable is False
 
 
 def test_rejects_negative_latency() -> None:

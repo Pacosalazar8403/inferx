@@ -168,7 +168,12 @@ async def chat_completions(
         logger.warning(
             "backend request failed",
             exc_info=True,
-            extra={"request_id": http_request.state.request_id, "backend": decision.backend},
+            extra={
+                "request_id": http_request.state.request_id,
+                "backend": decision.backend,
+                "retryable": error.retryable,
+                "backend_status_code": error.status_code,
+            },
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

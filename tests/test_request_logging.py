@@ -77,6 +77,7 @@ def test_backend_failure_is_logged_with_details(
     assert warning.request_id == response.headers["X-Request-ID"]
     assert warning.exc_info is not None
     assert "failed on purpose" in str(warning.exc_info[1])
+    assert warning.retryable is True
 
     (completed,) = logs_with_message(caplog, "request completed")
     assert completed.status == 502

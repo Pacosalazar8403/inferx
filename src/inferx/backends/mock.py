@@ -1,8 +1,8 @@
 """A fake backend for development and testing.
 
-It returns a predictable reply after a configurable delay, and can be
-told to fail on purpose. This lets us test routing, retries, and
-timeouts without a GPU or a paid API.
+It returns a predictable reply after a configurable delay, and can be told
+to fail on purpose, either temporarily (retryable) or permanently. This lets
+us test routing, retries, and timeouts without a GPU or a paid API.
 """
 
 import asyncio
@@ -36,6 +36,7 @@ class MockBackend(Backend):
         name: str = "mock",
         latency_seconds: float = 0.0,
         fail: bool = False,
+        retryable_failures: bool = True,
     ) -> None:
         if latency_seconds < 0:
             raise ValueError("latency_seconds cannot be negative")
@@ -43,6 +44,7 @@ class MockBackend(Backend):
         self.name = name
         self.latency_seconds = latency_seconds
         self.fail = fail
+        self.retryable_failures = retryable_failures
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         # Simulate the time a real model spends generating. This uses
@@ -50,7 +52,10 @@ class MockBackend(Backend):
         await asyncio.sleep(self.latency_seconds)
 
         if self.fail:
-            raise BackendError(f"backend '{self.name}' failed on purpose")
+            raise BackendError(
+                f"backend '{self.name}' failed on purpose",
+                retryable=self.retryable_failures,
+            )
 
         reply = f"Mock reply to: {request.messages[-1].content}"
         prompt_tokens = sum(approximate_tokens(m.content) for m in request.messages)
