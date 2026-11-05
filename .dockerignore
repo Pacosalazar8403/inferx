@@ -1,0 +1,13 @@
+# Local environment and caches: rebuilt inside the image, never copied.
+.venv/
+__pycache__/
+*.py[oc]
+.pytest_cache/
+
+# Version control and editor files.
+.git/
+.github/
+.vscode/
+
+# Not needed to run InferX.
+tests/
