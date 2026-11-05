@@ -51,6 +51,11 @@ failure_threshold = 2
 cooldown_seconds = 10.0
 """
 
+LIMITS_SECTION = """
+[limits]
+request_timeout_seconds = 45.0
+"""
+
 
 def write_config(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "gateway.toml"
@@ -84,6 +89,7 @@ def test_loads_valid_config_file_with_defaults(tmp_path: Path) -> None:
     assert config.backends[1].model == "big-model"
     assert config.retry.max_attempts == 3
     assert config.circuit_breaker.failure_threshold == 5
+    assert config.limits.request_timeout_seconds == 60.0
 
 
 def test_loads_retry_settings(tmp_path: Path) -> None:
@@ -103,6 +109,12 @@ def test_loads_circuit_breaker_settings(tmp_path: Path) -> None:
     breaker = backends["small"].breaker
     assert breaker.failure_threshold == 2
     assert breaker.cooldown_seconds == 10.0
+
+
+def test_loads_request_timeout(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, VALID_CONFIG + LIMITS_SECTION))
+
+    assert config.limits.request_timeout_seconds == 45.0
 
 
 def test_example_config_in_repo_is_valid() -> None:
@@ -160,6 +172,25 @@ def test_rejects_zero_circuit_breaker_threshold(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, text))
+
+
+def test_rejects_zero_request_timeout(tmp_path: Path) -> None:
+    text = VALID_CONFIG + LIMITS_SECTION.replace(
+        "request_timeout_seconds = 45.0", "request_timeout_seconds = 0"
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, text))
+
+
+def test_rejects_backend_timeout_longer_than_request_timeout(tmp_path: Path) -> None:
+    text = (
+        VALID_CONFIG.replace('model = "big-model"', 'model = "big-model"\ntimeout_seconds = 50.0')
+        + LIMITS_SECTION
+    )
+
+    with pytest.raises(ValidationError, match="could never finish"):
         load_config(write_config(tmp_path, text))
 
 

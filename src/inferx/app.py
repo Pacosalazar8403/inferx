@@ -3,6 +3,7 @@
 This module creates the FastAPI app and defines its routes.
 """
 
+import asyncio
 import logging
 import re
 import time
@@ -68,7 +69,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # backend opens a connection.
     app.state.router = build_router(gateway_config)
     app.state.backends = build_backends(gateway_config)
-    logger.info("inferx started", extra={"backends": sorted(app.state.backends)})
+    app.state.request_timeout_seconds = gateway_config.limits.request_timeout_seconds
+    logger.info(
+        "inferx started",
+        extra={
+            "backends": sorted(app.state.backends),
+            "request_timeout_seconds": app.state.request_timeout_seconds,
+        },
+    )
     try:
         yield
     finally:
@@ -137,6 +145,11 @@ def get_backends(request: Request) -> dict[str, Backend]:
     return request.app.state.backends
 
 
+def get_request_timeout(request: Request) -> float:
+    """Provide the total time budget, in seconds, for one request."""
+    return request.app.state.request_timeout_seconds
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """Report that the service is running.
@@ -154,8 +167,13 @@ async def chat_completions(
     response: Response,
     router: Annotated[LengthRouter, Depends(get_router)],
     backends: Annotated[dict[str, Backend], Depends(get_backends)],
+    request_timeout_seconds: Annotated[float, Depends(get_request_timeout)],
 ) -> ChatCompletionResponse:
-    """Route a chat request to a backend, falling back if it keeps failing."""
+    """Route a chat request to a backend, falling back if it keeps failing.
+
+    Everything (retries, backoff waits, and fallbacks) must finish within
+    the request's time budget, or the request ends with a 504.
+    """
     try:
         decision = router.route(chat_request)
     except UnknownModelError as error:
@@ -165,62 +183,84 @@ async def chat_completions(
         ) from error
 
     http_request.state.route_reason = decision.reason
+    http_request.state.backend = decision.backend
+    http_request.state.fallback_from = None
 
     # The routed backend first, then any fallbacks, in order.
     candidates = [decision.backend, *decision.fallbacks]
 
     start = time.perf_counter()
     try:
-        for index, backend_name in enumerate(candidates):
-            fallback_from = decision.backend if index > 0 else None
+        async with asyncio.timeout(request_timeout_seconds):
+            for index, backend_name in enumerate(candidates):
+                fallback_from = decision.backend if index > 0 else None
 
-            # Shared with the logging middleware, which writes them in its log line.
-            http_request.state.backend = backend_name
-            http_request.state.fallback_from = fallback_from
-            headers = routing_headers(backend_name, decision.reason, fallback_from)
+                # Shared with the logging middleware, which writes them in its log line.
+                http_request.state.backend = backend_name
+                http_request.state.fallback_from = fallback_from
+                headers = routing_headers(backend_name, decision.reason, fallback_from)
 
-            try:
-                result = await backends[backend_name].complete(chat_request)
-            except BackendError as error:
-                has_next_candidate = index + 1 < len(candidates)
+                try:
+                    result = await backends[backend_name].complete(chat_request)
+                except BackendError as error:
+                    has_next_candidate = index + 1 < len(candidates)
 
-                # Only fall back when the backend's health is the problem.
-                # A permanent failure would likely repeat, and silently moving
-                # traffic elsewhere could hide a misconfiguration.
-                if error.retryable and has_next_candidate:
+                    # Only fall back when the backend's health is the problem.
+                    # A permanent failure would likely repeat, and silently moving
+                    # traffic elsewhere could hide a misconfiguration.
+                    if error.retryable and has_next_candidate:
+                        logger.warning(
+                            "falling back to another backend",
+                            exc_info=True,
+                            extra={
+                                "backend": backend_name,
+                                "fallback_to": candidates[index + 1],
+                                "backend_status_code": error.status_code,
+                            },
+                        )
+                        continue
+
+                    # The full error goes to the server's logs. The client only gets
+                    # a generic message, so internal details never leak.
                     logger.warning(
-                        "falling back to another backend",
+                        "backend request failed",
                         exc_info=True,
                         extra={
                             "backend": backend_name,
-                            "fallback_to": candidates[index + 1],
+                            "retryable": error.retryable,
                             "backend_status_code": error.status_code,
                         },
                     )
-                    continue
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail="The model backend failed to respond.",
+                        headers=headers,
+                    ) from error
 
-                # The full error goes to the server's logs. The client only gets
-                # a generic message, so internal details never leak.
-                logger.warning(
-                    "backend request failed",
-                    exc_info=True,
-                    extra={
-                        "backend": backend_name,
-                        "retryable": error.retryable,
-                        "backend_status_code": error.status_code,
-                    },
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="The model backend failed to respond.",
-                    headers=headers,
-                ) from error
+                response.headers.update(headers)
+                return result
 
-            response.headers.update(headers)
-            return result
-
-        # The loop always returns or raises, because there is always at least
-        # one candidate. This line only exists to make that explicit.
-        raise AssertionError("no backend candidates")
+            # The loop always returns or raises, because there is always at least
+            # one candidate. This line only exists to make that explicit.
+            raise AssertionError("no backend candidates")
+    except TimeoutError as error:
+        # The budget ran out. asyncio.timeout already cancelled whatever was
+        # in progress (an HTTP call, a backoff wait), all the way down.
+        logger.warning(
+            "request deadline exceeded",
+            extra={
+                "backend": http_request.state.backend,
+                "request_timeout_seconds": request_timeout_seconds,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="The request took too long to complete.",
+            headers=routing_headers(
+                http_request.state.backend,
+                decision.reason,
+                http_request.state.fallback_from,
+            ),
+        ) from error
     finally:
         http_request.state.backend_latency_ms = elapsed_ms(start)
