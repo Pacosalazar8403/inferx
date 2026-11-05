@@ -1,4 +1,5 @@
-"""Gateway configuration: which backends exist and how requests are routed.
+"""Gateway configuration: which backends exist, how requests are routed,
+and how failures are retried.
 
 Loaded from a TOML file so several backends can be described in one place.
 Secrets never go in this file: a backend names the environment variable
@@ -15,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from inferx.backends.base import Backend
 from inferx.backends.mock import MockBackend
 from inferx.backends.openai_compatible import OpenAICompatibleBackend
+from inferx.backends.retrying import RetryingBackend, RetryPolicy
 from inferx.router import LengthRouter
 
 
@@ -24,6 +26,7 @@ class MockBackendConfig(BaseModel):
     type: Literal["mock"]
     name: str = Field(min_length=1)
     latency_seconds: float = Field(default=0.0, ge=0)
+    fail: bool = False
 
 
 class OpenAIBackendConfig(BaseModel):
@@ -52,11 +55,39 @@ class RoutingConfig(BaseModel):
     max_small_prompt_chars: int = Field(gt=0)
 
 
+class RetryConfig(BaseModel):
+    """Retry settings applied to every backend.
+
+    max_attempts is capped at 10, so a typo can't turn one failing request
+    into a flood of retries against a struggling server.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    base_delay_seconds: float = Field(default=0.1, ge=0)
+    max_delay_seconds: float = Field(default=2.0, ge=0)
+
+    @model_validator(mode="after")
+    def check_delays(self) -> "RetryConfig":
+        if self.max_delay_seconds < self.base_delay_seconds:
+            raise ValueError("max_delay_seconds cannot be less than base_delay_seconds")
+        return self
+
+    def to_policy(self) -> RetryPolicy:
+        return RetryPolicy(
+            max_attempts=self.max_attempts,
+            base_delay_seconds=self.base_delay_seconds,
+            max_delay_seconds=self.max_delay_seconds,
+        )
+
+
 class GatewayConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     backends: list[BackendConfig] = Field(min_length=1)
     routing: RoutingConfig
+    retry: RetryConfig = Field(default_factory=RetryConfig)
 
     @model_validator(mode="after")
     def check_backend_names_are_unique(self) -> "GatewayConfig":
@@ -89,9 +120,13 @@ def load_config(path: Path) -> GatewayConfig:
 
 
 def build_backend(config: MockBackendConfig | OpenAIBackendConfig) -> Backend:
-    """Create one backend from its config."""
+    """Create one backend from its config, without retries."""
     if isinstance(config, MockBackendConfig):
-        return MockBackend(name=config.name, latency_seconds=config.latency_seconds)
+        return MockBackend(
+            name=config.name,
+            latency_seconds=config.latency_seconds,
+            fail=config.fail,
+        )
 
     api_key = None
     if config.api_key_env:
@@ -112,8 +147,12 @@ def build_backend(config: MockBackendConfig | OpenAIBackendConfig) -> Backend:
 
 
 def build_backends(config: GatewayConfig) -> dict[str, Backend]:
-    """Create every configured backend, keyed by name."""
-    return {backend.name: build_backend(backend) for backend in config.backends}
+    """Create every configured backend, wrapped with retries, keyed by name."""
+    policy = config.retry.to_policy()
+    return {
+        backend.name: RetryingBackend(build_backend(backend), policy)
+        for backend in config.backends
+    }
 
 
 def build_router(config: GatewayConfig) -> LengthRouter:

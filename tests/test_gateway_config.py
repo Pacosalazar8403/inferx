@@ -8,8 +8,10 @@ from pydantic import ValidationError
 
 from inferx.backends.mock import MockBackend
 from inferx.backends.openai_compatible import OpenAICompatibleBackend
+from inferx.backends.retrying import RetryingBackend
 from inferx.gateway_config import (
     DEFAULT_CONFIG,
+    MockBackendConfig,
     OpenAIBackendConfig,
     build_backend,
     build_backends,
@@ -36,6 +38,13 @@ base_url = "http://model-server.test/v1"
 model = "big-model"
 """
 
+RETRY_SECTION = """
+[retry]
+max_attempts = 5
+base_delay_seconds = 0.2
+max_delay_seconds = 4.0
+"""
+
 
 def write_config(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "gateway.toml"
@@ -43,21 +52,31 @@ def write_config(tmp_path: Path, text: str) -> Path:
     return path
 
 
-def test_default_config_builds_mock_backends_and_router() -> None:
+def test_default_config_builds_retrying_backends_and_router() -> None:
     backends = build_backends(DEFAULT_CONFIG)
     router = build_router(DEFAULT_CONFIG)
 
     assert set(backends) == {"mock-small", "mock-large"}
-    assert all(isinstance(backend, MockBackend) for backend in backends.values())
+    assert all(isinstance(backend, RetryingBackend) for backend in backends.values())
     assert router.small_backend == "mock-small"
 
 
-def test_loads_valid_config_file(tmp_path: Path) -> None:
+def test_loads_valid_config_file_with_default_retries(tmp_path: Path) -> None:
     config = load_config(write_config(tmp_path, VALID_CONFIG))
 
     assert [backend.name for backend in config.backends] == ["small", "large"]
     assert isinstance(config.backends[1], OpenAIBackendConfig)
     assert config.backends[1].model == "big-model"
+    assert config.retry.max_attempts == 3
+
+
+def test_loads_retry_settings(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, VALID_CONFIG + RETRY_SECTION))
+
+    policy = config.retry.to_policy()
+    assert policy.max_attempts == 5
+    assert policy.base_delay_seconds == 0.2
+    assert policy.max_delay_seconds == 4.0
 
 
 def test_example_config_in_repo_is_valid() -> None:
@@ -87,12 +106,40 @@ def test_rejects_duplicate_backend_names(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, text))
 
 
+def test_rejects_retry_max_delay_below_base(tmp_path: Path) -> None:
+    text = VALID_CONFIG + RETRY_SECTION.replace("max_delay_seconds = 4.0", "max_delay_seconds = 0.1")
+
+    with pytest.raises(ValidationError, match="max_delay_seconds"):
+        load_config(write_config(tmp_path, text))
+
+
+def test_rejects_zero_retry_attempts(tmp_path: Path) -> None:
+    text = VALID_CONFIG + RETRY_SECTION.replace("max_attempts = 5", "max_attempts = 0")
+
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, text))
+
+
+def test_rejects_too_many_retry_attempts(tmp_path: Path) -> None:
+    text = VALID_CONFIG + RETRY_SECTION.replace("max_attempts = 5", "max_attempts = 100")
+
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, text))
+
+
 def test_router_pointing_at_missing_backend_is_rejected(tmp_path: Path) -> None:
     text = VALID_CONFIG.replace('large_backend = "large"', 'large_backend = "typo"')
     config = load_config(write_config(tmp_path, text))
 
     with pytest.raises(ValueError, match="unknown backends"):
         build_router(config)
+
+
+def test_mock_backend_can_be_configured_to_fail() -> None:
+    backend = build_backend(MockBackendConfig(type="mock", name="broken", fail=True))
+
+    assert isinstance(backend, MockBackend)
+    assert backend.fail is True
 
 
 @pytest.mark.anyio
