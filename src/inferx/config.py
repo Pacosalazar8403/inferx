@@ -6,6 +6,7 @@ so tests and CI never need a real model server.
 """
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,6 +19,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="INFERX_")
 
     config_path: Path | None = None
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
 
 def load_gateway_config(settings: Settings) -> GatewayConfig:

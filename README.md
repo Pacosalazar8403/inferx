@@ -16,10 +16,12 @@ InferX sits between client applications and multiple language model backends. Ea
 - Multiple backends at once, described in a TOML config file
 - Length-based router: with `"model": "auto"`, short prompts go to a small backend and long prompts go to a large one; clients can also name a backend directly
 - `X-InferX-Backend` and `X-InferX-Route-Reason` response headers on every request, including failures
+- Structured JSON logs with one line per request: request ID, status, route decision, total latency, and backend latency
+- Request IDs: generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
 - OpenAI-compatible HTTP backend that works with Ollama, vLLM, and hosted model APIs
 - Mock backend with simulated latency and forced failures, used for tests and CI
 - Strict config validation at startup: typos, unknown backend types, duplicate names, and missing API key variables are rejected before the server accepts traffic
-- Clear errors: `422` for invalid requests, `404` for unknown models, `502` when a backend fails (without exposing internal details)
+- Clear errors: `422` for invalid requests, `404` for unknown models, `502` when a backend fails (full details go to the server logs, not to the client)
 - `/health` endpoint and auto-generated OpenAPI docs
 - Automated tests with pytest, run in CI on every pull request
 
@@ -42,7 +44,7 @@ Requirements: [uv](https://docs.astral.sh/uv/), which installs the correct Pytho
 git clone https://github.com/Pacosalazar8403/inferx.git
 cd inferx
 uv sync
-uv run uvicorn inferx.app:app --reload
+uv run uvicorn inferx.app:app --reload --no-access-log
 ```
 
 Without a config file, InferX starts with two mock backends (`mock-small` and `mock-large`). In another terminal:
@@ -53,7 +55,7 @@ curl -s -i http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model": "auto", "messages": [{"role": "user", "content": "Hello InferX"}]}'
 ```
 
-The `x-inferx-backend` and `x-inferx-route-reason` headers show which backend handled the request and why. Interactive API docs are available at http://127.0.0.1:8000/docs.
+The `x-inferx-backend`, `x-inferx-route-reason`, and `x-request-id` headers show which backend handled the request, why, and the ID to search for in the logs. Interactive API docs are available at http://127.0.0.1:8000/docs.
 
 ### Using real models with Ollama
 
@@ -62,18 +64,31 @@ Install [Ollama](https://ollama.com), download two sizes of the same model famil
 ```bash
 ollama pull llama3.2:1b
 ollama pull llama3.2:3b
-INFERX_CONFIG_PATH=config/ollama.toml uv run uvicorn inferx.app:app --reload
+INFERX_CONFIG_PATH=config/ollama.toml uv run uvicorn inferx.app:app --reload --no-access-log
 ```
 
 Short prompts now go to `llama3.2:1b` and longer prompts to `llama3.2:3b`.
 
+## Logs
+
+InferX writes JSON logs to the terminal, one object per line. Every request produces one `request completed` line, for example:
+
+```json
+{"timestamp": "2026-11-04T23:24:02.285421+00:00", "level": "INFO", "logger": "inferx.app", "message": "request completed", "request_id": "juan-test-002", "method": "POST", "path": "/v1/chat/completions", "status": 200, "latency_ms": 269.69, "backend": "ollama-small", "route_reason": "short_prompt", "backend_latency_ms": 267.84}
+```
+
+`latency_ms` is the total time inside InferX, and `backend_latency_ms` is the time spent waiting on the model, so the difference is the gateway's own overhead. When a backend fails, a `backend request failed` warning with the full error is logged under the same request ID.
+
+`--no-access-log` turns off Uvicorn's plain-text request lines, since the JSON request logs replace them.
+
 ## Configuration
 
-InferX reads one environment variable:
+InferX reads these environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
 | `INFERX_CONFIG_PATH` | none | Path to a TOML config file. Without one, InferX uses two built-in mock backends. |
+| `INFERX_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 
 The config file lists the backends and the routing rules. See [`config/ollama.toml`](config/ollama.toml) for a complete example.
 
@@ -114,9 +129,10 @@ inferx/
 ├── config/
 │   └── ollama.toml               example config for two local Ollama models
 ├── src/inferx/
-│   ├── app.py                    FastAPI app, lifespan, and routes
+│   ├── app.py                    FastAPI app, lifespan, middleware, and routes
 │   ├── config.py                 environment settings
 │   ├── gateway_config.py         config file models and builders
+│   ├── observability.py          JSON log formatting and setup
 │   ├── router.py                 length-based router
 │   ├── schemas.py                request and response models
 │   └── backends/
