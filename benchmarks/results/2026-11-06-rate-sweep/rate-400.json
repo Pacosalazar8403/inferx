@@ -1,0 +1,31 @@
+{
+  "settings": {
+    "url": "http://127.0.0.1:8000",
+    "rate": 400.0,
+    "duration": 20.0,
+    "warmup": 5.0,
+    "model": "auto",
+    "content": "hi",
+    "timeout": 60.0,
+    "max_connections": 200,
+    "output": "benchmarks/results/2026-11-06-rate-sweep/rate-400.json"
+  },
+  "summary": {
+    "target_rate": 400.0,
+    "requests": 8000,
+    "sent_rate": 393.47,
+    "success_rate": 1.0,
+    "statuses": {
+      "200": 8000
+    },
+    "errors": {},
+    "latency_ms": {
+      "p50": 5155.26,
+      "p90": 9111.99,
+      "p95": 9610.72,
+      "p99": 9744.6,
+      "max": 9931.12
+    },
+    "max_start_lag_ms": 516.93
+  }
+}
