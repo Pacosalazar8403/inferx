@@ -21,6 +21,7 @@ InferX sits between client applications and multiple language model backends. Ea
 - A total time budget per request across retries, backoff waits, and fallbacks; when it runs out, in-progress work is cancelled and the client gets a `504`
 - Prometheus metrics at `/metrics`: request rate and latency histograms, backend outcomes, retries, fallbacks, deadlines, and current circuit breaker states
 - Docker Compose setup that runs InferX and Prometheus together, with a traffic script to try it out
+- An open-loop load generator and rate sweep script, with measured results and their method in [`benchmarks/`](benchmarks/README.md)
 - `X-InferX-Backend`, `X-InferX-Route-Reason`, and `X-InferX-Fallback-From` response headers show which backend answered, why, and whether it was a fallback, including on failures
 - Structured JSON logs with one line per request: request ID, status, route decision, fallback, total latency, and backend latency
 - Request IDs on every log line, including retries, fallbacks, circuit breaker changes, and deadlines, generated per request or reused from a safe incoming `X-Request-ID` header, and returned to the caller
@@ -34,6 +35,8 @@ InferX sits between client applications and multiple language model backends. Ea
 
 ### Planned
 
+- Repeated benchmark runs per configuration, to separate small effects from run-to-run variation
+- Multiple worker processes with shared metrics and circuit breaker state
 - Ollama in its own container in the Compose setup
 - Grafana dashboards for the metrics
 - Streaming responses for the chat endpoint
@@ -41,7 +44,30 @@ InferX sits between client applications and multiple language model backends. Ea
 - Smarter routing, evaluated against the length-based router as a baseline
 - Per-key rate limiting and response caching (Redis)
 - Usage and cost tracking (PostgreSQL)
-- Reproducible load tests and published benchmark results
+
+## Benchmarks
+
+Measured with InferX's own open-loop load generator against zero-latency mock backends, so these numbers describe the gateway itself, not model performance. One Uvicorn worker on a laptop (i7-12650H, WSL2), with InferX and the generator pinned to separate CPUs. The full method, all raw results, and the limitations are in [`benchmarks/README.md`](benchmarks/README.md).
+
+| target rps | p50 ms | p95 ms | p99 ms | success |
+|---|---|---|---|---|
+| 100 | 4.49 | 5.98 | 6.68 | 100.0% |
+| 200 | 4.41 | 8.09 | 15.32 | 100.0% |
+| 240 | 5.2 | 7.72 | 28.47 | 100.0% |
+| 260 | 7 | 31.47 | 92.1 | 100.0% |
+| 280 | 119.28 | 807.06 | 863.17 | 100.0% |
+| 320 | 2683.65 | 4195.16 | 4305.68 | 100.0% |
+
+- **Capacity is about 270 requests per second on one process.** Below that, the median stays near 5 ms; above it, requests queue and latency grows by orders of magnitude.
+- **p99 rises well before the median.** Between 200 and 240 requests per second, p50 barely moves while p99 roughly quadruples.
+- **Logging volume matters more than its CPU cost.** Logging every request produced about 370 bytes per request, roughly 8.6 GB per day at full capacity from one instance. Its CPU cost below capacity was too small to separate from run-to-run variation with one run per configuration.
+- **The gateway is unlikely to be the bottleneck with real models.** A local GPU serves a handful of model requests per second, about 100 times fewer than InferX's measured capacity.
+
+Run your own sweep against a running InferX:
+
+```bash
+scripts/rate_sweep.sh benchmarks/results/my-run
+```
 
 ## Quickstart
 
@@ -187,7 +213,7 @@ A manual run with `ollama-small` pointed at an unused port (so it always fails),
 | 3 | 0.15 s | Circuit open: the failing backend was skipped, straight to `llama3.2:3b` |
 | 4 | 0.18 s | Same as request 3 |
 
-Requests 2 to 4 are the fair comparison, since the model was warm for all of them. Request 1 is dominated by loading the model onto the GPU. This is a single run on one laptop (RTX 3060 Laptop GPU, 6 GB), not a benchmark; reproducible load tests are planned.
+Requests 2 to 4 are the fair comparison, since the model was warm for all of them. Request 1 is dominated by loading the model onto the GPU. This is a single run on one laptop (RTX 3060 Laptop GPU, 6 GB), not a benchmark.
 
 ## Metrics
 
@@ -311,16 +337,27 @@ Limits (optional):
 
 API keys never go in the config file. Set `api_key_env` to the name of an environment variable, and InferX reads the key from that variable at startup.
 
-The `max_small_prompt_chars` threshold in the example is a starting guess, not a tuned value. Choosing it from measured cost and quality data is part of the planned benchmarks.
+The `max_small_prompt_chars` threshold in the example is a starting guess, not a tuned value. Choosing it from measured cost and quality data is part of the planned work.
 
 ## Known limitations
 
+- **One worker process.** Measured capacity is about 270 requests per second. Running several workers would raise it, but each worker would have its own metrics registry and circuit breakers, so Prometheus would see per-worker numbers and circuits would open independently in each one.
 - **Retries don't know the remaining time budget.** A retry can start even when it can't finish before the deadline, and is then cancelled. Passing the remaining budget down so retries can skip themselves (deadline propagation) would avoid that wasted work.
-- **Circuit breaker state is per process and in memory.** Several InferX instances each track backends separately, and a restart resets every circuit to closed.
+- **Circuit breaker state is per process and in memory.** A restart resets every circuit to closed.
 - **The circuit breaker counts consecutive failures.** A backend that fails intermittently (for example, every other request) never trips it. A failure rate over a time window would catch that case.
 - **The circuit breaker metric shows the last known state.** A circuit only moves from `open` to `half_open` when a request arrives after its cooldown, so with no traffic, the metric keeps reporting `open`.
 - **`/metrics` and the Prometheus UI have no authentication.** Metrics reveal backend names and traffic patterns. Both are published only to `127.0.0.1` in the Compose setup; anything exposed beyond a private network would need access control.
+- **Benchmarks are one run per configuration on one laptop,** against mock backends. See [`benchmarks/README.md`](benchmarks/README.md) for the full list of caveats.
 - **The Compose setup uses mock backends.** Prometheus scrapes every 5 seconds to make the demo feel live; 15 to 60 seconds is more typical in production.
 - **Permanent failures don't fall back.** This is deliberate, so a misconfigured backend (like a bad API key) shows up as errors instead of silently shifting traffic, but it means some requests fail that another backend could have answered.
 - **One retry and circuit breaker policy for all backends.** A hosted API might deserve different settings than a local model.
-- **Retries can stack with other layers.** If clients and model servers also retry,
+- **Retries can stack with other layers.** If clients and model servers also retry, attempts multiply. Keep `max_attempts` small.
+- **The Docker setup reaches a local Ollama only through host networking.** That works on Linux for development but gives up network isolation. The image is also not published to a registry yet.
+
+## Running tests
+
+```bash
+uv run pytest -v
+```
+
+Tests use mock backends, a mock HTTP transport, a fake sleep function, and a fake clock, so they never need a model server. The deadline tests use short real timeouts (about 0.2 seconds) to check that cancellation really happens. Each
